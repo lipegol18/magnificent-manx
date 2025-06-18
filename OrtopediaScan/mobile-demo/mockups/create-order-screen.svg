@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="360" height="640" viewBox="0 0 360 640" xmlns="http://www.w3.org/2000/svg">
+  <!-- Fundo do telefone -->
+  <rect width="360" height="640" fill="#121212" />
+  
+  <!-- Status bar -->
+  <rect x="0" y="0" width="360" height="30" fill="#1e1e1e" />
+  <text x="310" y="20" font-family="Arial" font-size="14" fill="#ffffff">21:00</text>
+  <text x="20" y="20" font-family="Arial" font-size="14" fill="#ffffff">📶 📶</text>
+  
+  <!-- Header with back button -->
+  <rect x="0" y="30" width="360" height="50" fill="#1e1e1e" />
+  <text x="50" y="60" font-family="Arial" font-size="18" font-weight="bold" fill="#ffffff">Nova Ordem Médica</text>
+  <text x="20" y="60" font-family="Arial" font-size="20" fill="#ffffff">←</text>
+  
+  <!-- Stepper -->
+  <rect x="20" y="100" width="320" height="60" rx="5" fill="#2d2d2d" />
+  
+  <!-- Step circles and labels -->
+  <circle cx="60" cy="130" r="15" fill="#4f46e5" />
+  <text x="60" y="135" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">1</text>
+  <text x="60" y="155" font-family="Arial" font-size="12" fill="#ffffff" text-anchor="middle">Hospital</text>
+  
+  <circle cx="120" cy="130" r="15" fill="#333333" />
+  <text x="120" y="135" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">2</text>
+  <text x="120" y="155" font-family="Arial" font-size="12" fill="#b0b0b0" text-anchor="middle">Paciente</text>
+  
+  <circle cx="180" cy="130" r="15" fill="#333333" />
+  <text x="180" y="135" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">3</text>
+  <text x="180" y="155" font-family="Arial" font-size="12" fill="#b0b0b0" text-anchor="middle">Procedimento</text>
+  
+  <circle cx="240" cy="130" r="15" fill="#333333" />
+  <text x="240" y="135" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">4</text>
+  <text x="240" y="155" font-family="Arial" font-size="12" fill="#b0b0b0" text-anchor="middle">OPME</text>
+  
+  <circle cx="300" cy="130" r="15" fill="#333333" />
+  <text x="300" y="135" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">5</text>
+  <text x="300" y="155" font-family="Arial" font-size="12" fill="#b0b0b0" text-anchor="middle">Revisão</text>
+  
+  <!-- Step connector lines -->
+  <line x1="75" y1="130" x2="105" y2="130" stroke="#666666" stroke-width="2" />
+  <line x1="135" y1="130" x2="165" y2="130" stroke="#666666" stroke-width="2" />
+  <line x1="195" y1="130" x2="225" y2="130" stroke="#666666" stroke-width="2" />
+  <line x1="255" y1="130" x2="285" y2="130" stroke="#666666" stroke-width="2" />
+  
+  <!-- Step title -->
+  <text x="20" y="190" font-family="Arial" font-size="18" font-weight="bold" fill="#ffffff">Selecione o Hospital</text>
+  <text x="20" y="215" font-family="Arial" font-size="14" fill="#b0b0b0">Escolha o hospital onde será realizado o procedimento</text>
+  
+  <!-- Hospital selection cards -->
+  <!-- Hospital 1 -->
+  <rect x="20" y="240" width="320" height="80" rx="10" fill="#2d2d2d" />
+  <text x="90" y="270" font-family="Arial" font-size="16" font-weight="bold" fill="#ffffff">Hospital São Lucas</text>
+  <text x="90" y="295" font-family="Arial" font-size="14" fill="#b0b0b0">Rio de Janeiro, RJ</text>
+  <circle cx="50" cy="280" r="20" fill="#333333" />
+  <text x="50" y="286" font-family="Arial" font-size="22" fill="#ffffff" text-anchor="middle">🏥</text>
+  <circle cx="310" cy="280" r="12" fill="#4f46e5" />
+  <text x="310" y="285" font-family="Arial" font-size="16" fill="#ffffff" text-anchor="middle">✓</text>
+  
+  <!-- Hospital 2 -->
+  <rect x="20" y="330" width="320" height="80" rx="10" fill="#2d2d2d" />
+  <text x="90" y="360" font-family="Arial" font-size="16" font-weight="bold" fill="#ffffff">Hospital Albert Einstein</text>
+  <text x="90" y="385" font-family="Arial" font-size="14" fill="#b0b0b0">São Paulo, SP</text>
+  <circle cx="50" cy="370" r="20" fill="#333333" />
+  <text x="50" y="376" font-family="Arial" font-size="22" fill="#ffffff" text-anchor="middle">🏥</text>
+  <circle cx="310" cy="370" r="12" fill="#333333" />
+  
+  <!-- Hospital 3 -->
+  <rect x="20" y="420" width="320" height="80" rx="10" fill="#2d2d2d" />
+  <text x="90" y="450" font-family="Arial" font-size="16" font-weight="bold" fill="#ffffff">Hospital Samaritano</text>
+  <text x="90" y="475" font-family="Arial" font-size="14" fill="#b0b0b0">Rio de Janeiro, RJ</text>
+  <circle cx="50" cy="460" r="20" fill="#333333" />
+  <text x="50" y="466" font-family="Arial" font-size="22" fill="#ffffff" text-anchor="middle">🏥</text>
+  <circle cx="310" cy="460" r="12" fill="#333333" />
+  
+  <!-- Navigation buttons -->
+  <rect x="20" y="530" width="150" height="50" rx="5" fill="#333333" />
+  <text x="95" y="560" font-family="Arial" font-size="16" fill="#ffffff" text-anchor="middle">Voltar</text>
+  
+  <rect x="190" y="530" width="150" height="50" rx="5" fill="#4f46e5" />
+  <text x="265" y="560" font-family="Arial" font-size="16" fill="#ffffff" text-anchor="middle">Avançar</text>
+  
+  <!-- Bottom navigation -->
+  <rect x="0" y="610" width="360" height="60" fill="#1e1e1e" />
+  
+  <text x="45" y="640" font-family="Arial" font-size="12" fill="#999999" text-anchor="middle">Início</text>
+  <text x="45" y="630" font-family="Arial" font-size="16" fill="#999999" text-anchor="middle">🏠</text>
+  
+  <text x="135" y="640" font-family="Arial" font-size="12" fill="#999999" text-anchor="middle">Pacientes</text>
+  <text x="135" y="630" font-family="Arial" font-size="16" fill="#999999" text-anchor="middle">👥</text>
+  
+  <text x="225" y="640" font-family="Arial" font-size="12" fill="#999999" text-anchor="middle">Hospitais</text>
+  <text x="225" y="630" font-family="Arial" font-size="16" fill="#999999" text-anchor="middle">🏥</text>
+  
+  <text x="315" y="640" font-family="Arial" font-size="12" fill="#999999" text-anchor="middle">Mais</text>
+  <text x="315" y="630" font-family="Arial" font-size="16" fill="#999999" text-anchor="middle">•••</text>
+</svg>

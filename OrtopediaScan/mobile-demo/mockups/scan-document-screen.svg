@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="360" height="640" viewBox="0 0 360 640" xmlns="http://www.w3.org/2000/svg">
+  <!-- Fundo do telefone -->
+  <rect width="360" height="640" fill="#121212" />
+  
+  <!-- Status bar -->
+  <rect x="0" y="0" width="360" height="30" fill="#1e1e1e" />
+  <text x="310" y="20" font-family="Arial" font-size="14" fill="#ffffff">21:00</text>
+  <text x="20" y="20" font-family="Arial" font-size="14" fill="#ffffff">📶 📶</text>
+  
+  <!-- Camera view -->
+  <rect x="0" y="30" width="360" height="610" fill="#000000" />
+  
+  <!-- Document capture frame -->
+  <rect x="40" y="80" width="280" height="360" rx="10" stroke="#ffffff" stroke-width="2" fill="none" />
+  
+  <!-- Camera guide text -->
+  <rect x="60" y="460" width="240" height="40" rx="5" fill="rgba(0,0,0,0.5)" />
+  <text x="180" y="483" font-family="Arial" font-size="14" fill="#ffffff" text-anchor="middle">Alinhe o documento dentro da moldura</text>
+  
+  <!-- Camera controls -->
+  <rect x="0" y="520" width="360" height="90" fill="rgba(0,0,0,0.3)" />
+  
+  <text x="70" y="565" font-family="Arial" font-size="16" fill="#ffffff" text-anchor="middle">Flip</text>
+  
+  <circle cx="180" cy="560" r="30" fill="rgba(255,255,255,0.3)" />
+  <circle cx="180" cy="560" r="25" fill="#ffffff" />
+  
+  <text x="290" y="565" font-family="Arial" font-size="16" fill="#ffffff" text-anchor="middle">Cancelar</text>
+</svg>

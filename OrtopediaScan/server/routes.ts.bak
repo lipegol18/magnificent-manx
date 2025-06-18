@@ -1,0 +1,3558 @@
+import type { Express, Request } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { z } from "zod";
+import { User } from "@shared/schema";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
+
+// Ampliação da interface Request para incluir o usuário autenticado
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+import { 
+  insertPatientSchema, 
+  insertOpmeItemSchema, 
+  insertMedicalOrderSchema,
+  insertOrderItemSchema,
+  insertScannedDocumentSchema,
+  brazilianStates,
+  municipalities,
+  insertHospitalSchema,
+  insertUserSchema,
+  insertRoleSchema,
+  insertRolePermissionSchema,
+  insertUserPermissionSchema,
+  insertCidCodeSchema,
+  insertSupplierSchema,
+  insertNotificationSchema,
+  insertContactMessageSchema,
+  insertDoctorPatientSchema
+} from "@shared/schema";
+import { setupAuth, isAuthenticated, hasPermission, hasPermissionCheck } from "./auth";
+import { WebhookService } from "./services/webhook-service";
+import { scrypt, randomBytes } from "crypto";
+import { promisify } from "util";
+import { setupUploadRoutes } from "./upload-routes";
+import { comparePasswords } from "./utils";
+
+// Definir a função hashPassword localmente devido a problemas com importação
+const scryptAsync = promisify(scrypt);
+async function hashPasswordLocal(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  const buf = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${buf.toString("hex")}.${salt}`;
+}
+
+// Função para validar CRM (simulada para demonstração)
+// Em uma aplicação real, isso seria feito consultando uma API externa do CFM
+const getMockedDoctors = () => [
+  { crm: "123456", name: "Dr. Carlos Eduardo Silva", city: "Rio de Janeiro", state: "RJ" },
+  { crm: "234567", name: "Dra. Ana Paula Souza", city: "São Paulo", state: "SP" },
+  { crm: "345678", name: "Dr. Roberto Alves", city: "Belo Horizonte", state: "MG" },
+  { crm: "456789", name: "Dra. Maria Cristina Santos", city: "Rio de Janeiro", state: "RJ" },
+  { crm: "567890", name: "Dr. João Ricardo Ferreira", city: "São Paulo", state: "SP" },
+  { crm: "654321", name: "Dra. Maria Santos", city: "Rio de Janeiro", state: "RJ" },
+  { crm: "789012", name: "Dr. Carlos Oliveira", city: "São Paulo", state: "SP" },
+  { crm: "52251289", name: "Dr. Sérgio Luiz Carvalho Manhães", city: "Rio de Janeiro", state: "RJ" },
+  { crm: "5201039326", name: "Dr. Rodrigo Ortopedista", city: "Niterói", state: "RJ" },
+];
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Configurar autenticação
+  setupAuth(app);
+  
+  // Configurar rotas de upload
+  setupUploadRoutes(app);
+  
+  // Rota de teste para webhook - usa o método utilitário do WebhookService
+  app.get("/api/test-webhook", (req, res) => {
+    try {
+      const testMode = req.query.test === 'true';
+      const verbose = req.query.verbose === 'true';
+      const eventType = (req.query.event as string) || 'test_event';
+      
+      // Obter usuário autenticado se disponível
+      const user = req.user as User;
+      
+      // Usar o método utilitário do WebhookService para fazer o teste
+      const result = WebhookService.testWebhook(
+        eventType,
+        testMode,
+        verbose,
+        user ? {
+          id: user.id,
+          username: user.username,
+          name: user.name
+        } : undefined
+      );
+      
+      // Adicionar informações adicionais ao resultado
+      const response = {
+        ...result,
+        testMode,
+        verbose,
+        authenticated: !!user
+      };
+      
+      // Responder ao cliente
+      res.status(result.success ? 200 : 500).json(response);
+    } catch (error) {
+      console.error('Erro ao testar webhook:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Erro ao testar webhook',
+        error: (error as Error).message
+      });
+    }
+  });
+  
+  // Rota temporária para redefinir senha de um usuário para testes
+  app.get("/api/reset-test-password/:username", async (req, res) => {
+    try {
+      // Esta rota é apenas para ambiente de desenvolvimento
+      if (process.env.NODE_ENV !== 'development') {
+        return res.status(403).json({
+          success: false,
+          message: 'Esta rota só está disponível em ambiente de desenvolvimento'
+        });
+      }
+      
+      const { username } = req.params;
+      const newPassword = 'Teste@123'; // Senha padrão para testes
+      
+      // Hash da senha
+      const hashedPassword = await hashPasswordLocal(newPassword);
+      
+      // Atualizar a senha no banco de dados
+      const updated = await storage.updateUserPassword(username, hashedPassword);
+      
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          message: `Usuário ${username} não encontrado`
+        });
+      }
+      
+      return res.status(200).json({
+        success: true,
+        message: `Senha do usuário ${username} redefinida para fins de teste`,
+        testPassword: newPassword
+      });
+    } catch (error) {
+      console.error('Erro ao redefinir senha:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Erro ao redefinir senha',
+        error: (error as Error).message
+      });
+    }
+  });
+  
+  // Rota de teste para URL específica
+  app.get("/api/test-webhook-url", (req, res) => {
+    try {
+      fetch("https://webhook.site/5e8cef5e-62c1-4e64-8e88-2eb06be9f15e", {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          event: "test_webhook_url",
+          timestamp: new Date().toISOString(),
+          message: "Este é um teste de webhook para URL específica",
+          data: {
+            testId: 456,
+            testName: "Teste URL Específica",
+            testType: "webhook-test"
+          }
+        }),
+      })
+      .then(response => {
+        console.log('Resposta do webhook:', response.status);
+        return response.text();
+      })
+      .then(text => {
+        console.log('Resposta do webhook (texto):', text);
+      })
+      .catch(error => {
+        console.error('Erro ao enviar para URL webhook específica:', error);
+      });
+      
+      res.status(200).json({
+        success: true,
+        message: "Teste para URL específica enviado com sucesso"
+      });
+    } catch (error) {
+      console.error('Erro ao executar teste de webhook URL específica:', error);
+      res.status(500).json({
+        success: false,
+        message: "Erro ao enviar teste para URL específica"
+      });
+    }
+  });
+  
+  // Endpoint para teste de notificações por webhook
+  app.post("/api/notifications/webhook-test", isAuthenticated, hasPermission("admin"), async (req, res) => {
+    try {
+      const user = req.user;
+      const eventType = req.body.eventType || "test_event";
+      const customData = req.body.data || {};
+      
+      // Como estamos usando o middleware isAuthenticated, o usuário deve existir
+      // mas verificamos para evitar erros
+      if (!user) {
+        return res.status(401).json({ 
+          success: false, 
+          message: "Não autorizado" 
+        });
+      }
+      
+      const data = {
+        event: eventType,
+        timestamp: new Date().toISOString(),
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          name: user.name
+        },
+        data: customData
+      };
+      
+      // Enviar notificação de forma assíncrona
+      WebhookService.sendNotification(data);
+      
+      res.status(200).json({ 
+        success: true, 
+        message: "Notificação webhook enviada de forma assíncrona"
+      });
+    } catch (error) {
+      console.error("Erro ao enviar teste de webhook:", error);
+      res.status(500).json({ 
+        success: false, 
+        message: "Erro ao processar solicitação de teste de webhook"
+      });
+    }
+  });
+  
+  // API routes are prefixed with /api
+  
+  // Status route para clientes verificarem se a API está disponível
+  app.get("/api/status", (req, res) => {
+    res.json({
+      status: "online",
+      version: "1.0.0",
+      timestamp: new Date().toISOString()
+    });
+  });
+  
+  // Rota para inicializar perfis e permissões
+  app.post("/api/init-data", async (req, res) => {
+    try {
+      // Verificar se já existem perfis
+      const existingRoles = await storage.getRoles();
+      
+      if (existingRoles.length === 0) {
+        // Criar perfis padrão
+        const adminRole = await storage.createRole({
+          name: "Administrador",
+          description: "Acesso completo ao sistema",
+          isDefault: false
+        });
+        
+        const doctorRole = await storage.createRole({
+          name: "Médico",
+          description: "Médicos com acesso a recursos clínicos",
+          isDefault: true
+        });
+        
+        const assistantRole = await storage.createRole({
+          name: "Assistente Básico",
+          description: "Assistente administrativo para tarefas básicas",
+          isDefault: false
+        });
+        
+        // Adicionar permissões ao perfil de administrador
+        const adminPermissions = [
+          "dashboard_view",
+          "patients_view", "patients_create", "patients_edit", "patients_delete",
+          "hospitals_view", "hospitals_create", "hospitals_edit", "hospitals_delete",
+          "orders_view", "orders_create", "orders_edit", "orders_delete", 
+          "catalog_view", "catalog_create", "catalog_edit", "catalog_delete",
+          "reports_view", "reports_create", "reports_export",
+          "users_view", "users_create", "users_edit", "users_delete",
+          "roles_view", "roles_create", "roles_edit", "roles_delete",
+          "system_settings"
+        ];
+        
+        for (const permission of adminPermissions) {
+          await storage.addRolePermission({
+            roleId: adminRole.id,
+            permission: permission as any
+          });
+        }
+        
+        // Adicionar permissões ao perfil de médico
+        const doctorPermissions = [
+          "dashboard_view",
+          "patients_view", "patients_create", "patients_edit",
+          "hospitals_view",
+          "orders_view", "orders_create", "orders_edit",
+          "catalog_view",
+          "reports_view", "reports_export"
+        ];
+        
+        for (const permission of doctorPermissions) {
+          await storage.addRolePermission({
+            roleId: doctorRole.id,
+            permission: permission as any
+          });
+        }
+        
+        // Adicionar permissões ao perfil de assistente
+        const assistantPermissions = [
+          "dashboard_view",
+          "patients_view", "patients_create",
+          "hospitals_view",
+          "orders_view",
+          "catalog_view",
+          "reports_view"
+        ];
+        
+        for (const permission of assistantPermissions) {
+          await storage.addRolePermission({
+            roleId: assistantRole.id,
+            permission: permission as any
+          });
+        }
+        
+        res.status(201).json({
+          message: "Dados iniciais criados com sucesso",
+          roles: [adminRole, doctorRole, assistantRole]
+        });
+      } else {
+        res.status(200).json({
+          message: "Dados já inicializados",
+          roles: existingRoles
+        });
+      }
+    } catch (error) {
+      console.error("Erro ao inicializar dados:", error);
+      res.status(500).json({ message: "Falha ao inicializar dados" });
+    }
+  });
+  
+  // Patient routes
+  app.get("/api/patients", async (req, res) => {
+    try {
+      const patients = await storage.getPatients();
+      res.json(patients);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch patients" });
+    }
+  });
+  
+  // Nova rota para pesquisa de pacientes (por nome ou CPF)
+  app.get("/api/patients/search", async (req, res) => {
+    const query = req.query.q as string;
+    
+    if (!query || query.trim().length < 2) {
+      return res.status(400).json({ message: "Search query must have at least 2 characters" });
+    }
+    
+    try {
+      console.log(`Pesquisando pacientes com query: "${query}"`);
+      
+      // Obter todos os pacientes
+      const allPatients = await storage.getPatients();
+      console.log(`Total de pacientes no sistema: ${allPatients.length}`);
+      
+      // Determinar se parece ser uma busca por CPF (apenas dígitos)
+      const isNumericQuery = /^\d+$/.test(query.trim());
+      
+      // Filtrar os pacientes
+      const results = allPatients.filter(patient => {
+        if (isNumericQuery) {
+          // BUSCA POR CPF (apenas números)
+          // Remove caracteres não numéricos para comparar CPFs
+          const cpfPatient = patient.cpf.replace(/\D/g, '');
+          
+          // Este método funciona bem, manteremos
+          return cpfPatient.includes(query.trim());
+        } else {
+          // BUSCA POR NOME - usar exatamente o mesmo método que o CPF
+          // Vamos procurar apenas pelo texto específico, sem começar por...
+          
+          // Normalizar o nome e a query para facilitar a comparação
+          const nameToSearch = patient.fullName.toLowerCase();
+          const queryToSearch = query.trim().toLowerCase();
+          
+          // Usar exatamente o mesmo método que usa para CPF
+          // Verificar se o nome contém o texto da busca
+          return nameToSearch.includes(queryToSearch);
+        }
+      });
+      
+      console.log(`Pacientes encontrados: ${results.length}`);
+      
+      // Limitar resultados a 10
+      const limitedResults = results.slice(0, 10);
+      
+      res.json(limitedResults);
+    } catch (error) {
+      console.error("Erro ao pesquisar pacientes:", error);
+      res.status(500).json({ message: "Failed to search patients" });
+    }
+  });
+  
+  // Endpoint para buscar paciente por CPF
+  app.get("/api/patients/cpf/:cpf", async (req, res) => {
+    try {
+      const cpf = req.params.cpf;
+      
+      // Remove caracteres não numéricos para padronizar
+      const cleanCPF = cpf.replace(/\D/g, '');
+      
+      if (!cleanCPF || cleanCPF.length !== 11) {
+        return res.status(400).json({ message: "CPF inválido" });
+      }
+      
+      // Busca pelo CPF limpo
+      let patient = await storage.getPatientByCPF(cleanCPF);
+      
+      // Se não encontrou, tenta com o CPF formatado
+      if (!patient) {
+        // Tenta diferentes formatações de CPF que podem estar no banco
+        const formattedCPF = `${cleanCPF.slice(0, 3)}.${cleanCPF.slice(3, 6)}.${cleanCPF.slice(6, 9)}-${cleanCPF.slice(9, 11)}`;
+        patient = await storage.getPatientByCPF(formattedCPF);
+      }
+      
+      if (!patient) {
+        return res.status(404).json({ message: "Paciente não encontrado" });
+      }
+      
+      res.json(patient);
+    } catch (error) {
+      console.error("Erro ao buscar paciente por CPF:", error);
+      res.status(500).json({ message: "Falha ao buscar paciente por CPF" });
+    }
+  });
+
+  // Endpoint para verificar se um CPF já existe (para validação)
+  app.get("/api/patients/cpf/:cpf/exists", async (req, res) => {
+    try {
+      const cpf = req.params.cpf;
+      const excludeId = req.query.excludeId ? parseInt(req.query.excludeId as string) : undefined;
+      
+      // Remove caracteres não numéricos para padronizar
+      const cleanCPF = cpf.replace(/\D/g, '');
+      
+      if (!cleanCPF || cleanCPF.length !== 11) {
+        return res.status(400).json({ 
+          exists: false,
+          message: "CPF inválido" 
+        });
+      }
+      
+      // Buscar pacientes com esse CPF
+      let patient = await storage.getPatientByCPF(cleanCPF);
+      
+      // Se não encontrou, tentar com o CPF formatado
+      if (!patient) {
+        const formattedCPF = `${cleanCPF.slice(0, 3)}.${cleanCPF.slice(3, 6)}.${cleanCPF.slice(6, 9)}-${cleanCPF.slice(9, 11)}`;
+        patient = await storage.getPatientByCPF(formattedCPF);
+      }
+      
+      // Verificar se encontrou algum paciente
+      if (!patient) {
+        return res.json({ exists: false });
+      }
+      
+      // Se estamos excluindo um ID (caso de edição), verificar se é o mesmo paciente
+      if (excludeId && patient.id === excludeId) {
+        return res.json({ exists: false });
+      }
+      
+      // Paciente existe e não é o mesmo que estamos excluindo
+      return res.json({ exists: true });
+    } catch (error) {
+      console.error("Erro ao verificar existência de CPF:", error);
+      res.status(500).json({ 
+        exists: false,
+        message: "Falha ao verificar CPF" 
+      });
+    }
+  });
+
+  app.get("/api/patients/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid patient ID" });
+      }
+      
+      const patient = await storage.getPatient(id);
+      if (!patient) {
+        return res.status(404).json({ message: "Patient not found" });
+      }
+      
+      res.json(patient);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch patient" });
+    }
+  });
+
+  app.post("/api/patients", async (req, res) => {
+    try {
+      const patientData = insertPatientSchema.parse(req.body);
+      const existingPatient = await storage.getPatientByCPF(patientData.cpf);
+      
+      if (existingPatient) {
+        return res.status(409).json({ message: "Patient with this CPF already exists" });
+      }
+      
+      const patient = await storage.createPatient(patientData);
+      res.status(201).json(patient);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid patient data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create patient" });
+    }
+  });
+
+  app.put("/api/patients/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid patient ID" });
+      }
+      
+      const patientData = insertPatientSchema.partial().parse(req.body);
+      const updatedPatient = await storage.updatePatient(id, patientData);
+      
+      if (!updatedPatient) {
+        return res.status(404).json({ message: "Patient not found" });
+      }
+      
+      res.json(updatedPatient);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid patient data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update patient" });
+    }
+  });
+
+  app.delete("/api/patients/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid patient ID" });
+      }
+      
+      const deleted = await storage.deletePatient(id);
+      if (!deleted) {
+        return res.status(404).json({ message: "Patient not found" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete patient" });
+    }
+  });
+
+  // OPME item routes
+  app.get("/api/opme-items", async (req, res) => {
+    try {
+      const searchTerm = req.query.search as string | undefined;
+      
+      if (searchTerm) {
+        const items = await storage.searchOpmeItems(searchTerm);
+        return res.json(items);
+      }
+      
+      const items = await storage.getOpmeItems();
+      res.json(items);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch OPME items" });
+    }
+  });
+
+  app.get("/api/opme-items/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid OPME item ID" });
+      }
+      
+      const item = await storage.getOpmeItem(id);
+      if (!item) {
+        return res.status(404).json({ message: "OPME item not found" });
+      }
+      
+      res.json(item);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch OPME item" });
+    }
+  });
+
+  app.post("/api/opme-items", async (req, res) => {
+    try {
+      const itemData = insertOpmeItemSchema.parse(req.body);
+      const item = await storage.createOpmeItem(itemData);
+      res.status(201).json(item);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid OPME item data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create OPME item" });
+    }
+  });
+
+  // Procedure routes
+  app.get("/api/procedures", async (req, res) => {
+    try {
+      const procedures = await storage.getProcedures();
+      res.json(procedures);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch procedures" });
+    }
+  });
+  
+  // Rota para pesquisar procedimentos CBHPM por código ou descrição - IMPORTANTE: deve vir antes da rota :id
+  app.get("/api/procedures/search", async (req, res) => {
+    try {
+      const searchTerm = (req.query.q || req.query.term) as string;
+      
+      console.log("Query params recebidos:", req.query);
+      console.log("Termo de busca extraído:", searchTerm);
+      
+      if (!searchTerm || searchTerm.trim().length < 3) {
+        return res.status(400).json({ 
+          message: "Termo de busca necessário com pelo menos 3 caracteres" 
+        });
+      }
+      
+      // Implementar busca na classe storage
+      const procedures = await storage.searchProcedures(searchTerm);
+      res.json(procedures);
+    } catch (error) {
+      console.error("Erro ao pesquisar procedimentos:", error);
+      res.status(500).json({ message: "Falha ao pesquisar procedimentos" });
+    }
+  });
+  
+  // Rota para obter procedimento CBHPM por ID
+  app.get("/api/procedures/:id", async (req, res) => {
+    try {
+      const procedureId = parseInt(req.params.id);
+      
+      if (isNaN(procedureId)) {
+        return res.status(400).json({ message: "ID de procedimento inválido" });
+      }
+      
+      const procedure = await storage.getProcedure(procedureId);
+      if (!procedure) {
+        return res.status(404).json({ message: "Procedimento não encontrado" });
+      }
+      
+      res.json(procedure);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar procedimento" });
+    }
+  });
+
+  // Medical order routes
+  app.get("/api/medical-orders", async (req, res) => {
+    try {
+      const patientId = req.query.patientId ? parseInt(req.query.patientId as string) : undefined;
+      
+      if (patientId && !isNaN(patientId)) {
+        const orders = await storage.getMedicalOrdersForPatient(patientId);
+        return res.json(orders);
+      }
+      
+      const orders = await storage.getMedicalOrders();
+      res.json(orders);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch medical orders" });
+    }
+  });
+  
+  // Rota para obter um pedido médico específico
+  app.get("/api/medical-orders/:id", async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "Invalid order ID" });
+      }
+      
+      const order = await storage.getMedicalOrder(orderId);
+      if (!order) {
+        return res.status(404).json({ message: "Medical order not found" });
+      }
+      
+      // Enriquecer o pedido médico com dados relacionados
+      const enrichedOrder: any = { ...order };
+      
+      // Buscar informações completas do CID se um ID foi fornecido
+      if (order.cidCodeId) {
+        try {
+          const cidCode = await storage.getCidCode(order.cidCodeId);
+          if (cidCode) {
+            enrichedOrder.cidCode = cidCode.code;
+            enrichedOrder.cidDescription = cidCode.description;
+            enrichedOrder.cidCodeFull = cidCode;
+          }
+        } catch (cidError) {
+          console.error("Erro ao buscar informações do CID:", cidError);
+        }
+      }
+      
+      // Buscar informações completas do procedimento CBHPM principal se um ID foi fornecido
+      if (order.procedureCbhpmId) {
+        try {
+          const procedure = await storage.getProcedure(order.procedureCbhpmId);
+          if (procedure) {
+            enrichedOrder.procedureCbhpmCode = procedure.code;
+            enrichedOrder.procedureCbhpmName = procedure.name;
+            enrichedOrder.procedureCbhpmFull = procedure;
+          }
+        } catch (procedureError) {
+          console.error("Erro ao buscar informações do procedimento CBHPM principal:", procedureError);
+        }
+      }
+      
+      // Buscar informações dos procedimentos CBHPM secundários se disponíveis
+      if (order.secondaryProcedureIds && order.secondaryProcedureIds.length > 0) {
+        try {
+          const secondaryProcedures = [];
+          for (let i = 0; i < order.secondaryProcedureIds.length; i++) {
+            const procedureId = order.secondaryProcedureIds[i];
+            const quantity = order.secondaryProcedureQuantities?.[i] || 1;
+            
+            const procedure = await storage.getProcedure(procedureId);
+            if (procedure) {
+              secondaryProcedures.push({
+                ...procedure,
+                quantity: quantity
+              });
+            }
+          }
+          
+          if (secondaryProcedures.length > 0) {
+            enrichedOrder.secondaryProcedures = secondaryProcedures;
+          }
+        } catch (secondaryError) {
+          console.error("Erro ao buscar informações dos procedimentos CBHPM secundários:", secondaryError);
+        }
+      }
+      
+      // Buscar informações do hospital
+      if (order.hospitalId) {
+        try {
+          const hospital = await storage.getHospital(order.hospitalId);
+          if (hospital) {
+            enrichedOrder.hospital = hospital;
+          }
+        } catch (hospitalError) {
+          console.error("Erro ao buscar informações do hospital:", hospitalError);
+        }
+      }
+      
+      // Buscar informações do paciente
+      if (order.patientId) {
+        try {
+          const patient = await storage.getPatient(order.patientId);
+          if (patient) {
+            enrichedOrder.patient = patient;
+          }
+        } catch (patientError) {
+          console.error("Erro ao buscar informações do paciente:", patientError);
+        }
+      }
+      
+      res.json(enrichedOrder);
+    } catch (error) {
+      console.error("Erro ao buscar pedido médico:", error);
+      res.status(500).json({ message: "Failed to fetch medical order" });
+    }
+  });
+
+  app.post("/api/medical-orders", async (req, res) => {
+    try {
+      const orderData = insertMedicalOrderSchema.parse(req.body);
+      const order = await storage.createMedicalOrder(orderData);
+      
+      // Notificar sobre a criação de nova ordem via webhook
+      WebhookService.notifyNewOrder(order);
+      
+      res.status(201).json(order);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid medical order data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create medical order" });
+    }
+  });
+
+  // Rota para atualizar um pedido médico (PUT completo)
+  app.put("/api/medical-orders/:id", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "Invalid order ID" });
+      }
+      
+      const orderData = insertMedicalOrderSchema.partial().parse(req.body);
+      const order = await storage.getMedicalOrder(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Medical order not found" });
+      }
+      
+      // Se o usuário não tem permissão para editar pedidos de outros, verificar se é o criador
+      if (!hasPermissionCheck(req, "orders_edit") && order.userId !== req.user?.id) {
+        return res.status(403).json({ message: "Permission denied" });
+      }
+      
+      // Logs detalhados dos valores de lateralidade antes e depois da atualização
+      console.log("VALORES DE LATERALIDADE ORIGINAIS:", {
+        cidLaterality: order.cidLaterality,
+        procedureLaterality: order.procedureLaterality,
+        secondaryProcedureLateralities: order.secondaryProcedureLateralities
+      });
+      
+      console.log("VALORES DE LATERALIDADE A SEREM ATUALIZADOS:", {
+        cidLaterality: orderData.cidLaterality,
+        procedureLaterality: orderData.procedureLaterality,
+        secondaryProcedureLateralities: orderData.secondaryProcedureLateralities
+      });
+      
+      // Garantir que as lateralidades não sejam perdidas na atualização
+      // Se cidLaterality for undefined ou 'null' como string e já existir um valor válido no banco, manter o valor original
+      if ((orderData.cidLaterality === undefined || orderData.cidLaterality === 'null') && order.cidLaterality) {
+        orderData.cidLaterality = order.cidLaterality;
+      }
+      
+      // Se procedureLaterality for undefined ou 'null' como string e já existir um valor válido no banco, manter o valor original
+      if ((orderData.procedureLaterality === undefined || orderData.procedureLaterality === 'null') && order.procedureLaterality) {
+        orderData.procedureLaterality = order.procedureLaterality;
+      }
+      
+      // Tratamento especial para secondaryProcedureLateralities para garantir que valores não sejam perdidos
+      if (orderData.secondaryProcedureLateralities && order.secondaryProcedureLateralities) {
+        // Criar um novo array com valores corrigidos
+        orderData.secondaryProcedureLateralities = orderData.secondaryProcedureLateralities.map((lat, index) => {
+          // Se o valor atual for 'null' (string) ou undefined, usar o valor anterior se existir
+          if (lat === 'null' || lat === undefined) {
+            return order.secondaryProcedureLateralities[index] || null;
+          }
+          return lat;
+        });
+      } else if (orderData.secondaryProcedureLateralities === undefined && order.secondaryProcedureLateralities) {
+        orderData.secondaryProcedureLateralities = order.secondaryProcedureLateralities;
+      }
+      
+      // Atualizar o pedido principal
+      const updatedOrder = await storage.updateMedicalOrder(orderId, orderData);
+      
+      // Logs após a atualização
+      console.log("VALORES DE LATERALIDADE APÓS ATUALIZAÇÃO:", {
+        cidLaterality: updatedOrder?.cidLaterality,
+        procedureLaterality: updatedOrder?.procedureLaterality,
+        secondaryProcedureLateralities: updatedOrder?.secondaryProcedureLateralities
+      });
+      
+      // Processar procedimentos secundários e itens OPME
+      // Os campos já são parte do schema e estão sendo atualizados automaticamente
+      console.log("Pedido atualizado com sucesso incluindo procedimentos secundários e itens OPME");
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid medical order data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update medical order" });
+    }
+  });
+  
+  // Rota para obter pedido em andamento (em preenchimento) do usuário atual
+  app.get("/api/medical-orders/in-progress", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user?.id;
+      
+      if (!userId) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      
+      console.log(`Buscando pedido em andamento para usuário ID: ${userId}`);
+      
+      const order = await storage.getMedicalOrderInProgressByUser(userId);
+      
+      if (!order) {
+        console.log(`Nenhum pedido em andamento encontrado para usuário ID: ${userId}`);
+        return res.status(404).json({ message: "No order in progress found" });
+      }
+      
+      console.log(`Pedido em andamento encontrado: ${order.id}`);
+      console.log("DADOS DE LATERALIDADE DO PEDIDO EM ANDAMENTO:", {
+        cidLaterality: order.cidLaterality,
+        procedureLaterality: order.procedureLaterality,
+        secondaryProcedureLateralities: order.secondaryProcedureLateralities
+      });
+      
+      // Enriquecer o pedido médico com dados relacionados
+      const enrichedOrder: any = { 
+        ...order,
+        // Garantir explicitamente que os campos de lateralidade sejam incluídos
+        cidLaterality: order.cidLaterality,
+        procedureLaterality: order.procedureLaterality,
+        secondaryProcedureLateralities: order.secondaryProcedureLateralities || []
+      };
+      
+      // Buscar informações completas do CID se um ID foi fornecido
+      if (order.cidCodeId) {
+        try {
+          const cidCode = await storage.getCidCode(order.cidCodeId);
+          if (cidCode) {
+            enrichedOrder.cidCode = cidCode.code;
+            enrichedOrder.cidDescription = cidCode.description;
+            enrichedOrder.cidCodeFull = cidCode;
+          }
+        } catch (cidError) {
+          console.error("Erro ao buscar informações do CID:", cidError);
+        }
+      }
+      
+      // Buscar informações completas do procedimento CBHPM se um ID foi fornecido
+      if (order.procedureCbhpmId) {
+        try {
+          const procedure = await storage.getProcedure(order.procedureCbhpmId);
+          if (procedure) {
+            enrichedOrder.procedureCbhpmCode = procedure.code;
+            enrichedOrder.procedureCbhpmName = procedure.name;
+            enrichedOrder.procedureCbhpmFull = procedure;
+          }
+        } catch (procedureError) {
+          console.error("Erro ao buscar informações do procedimento CBHPM:", procedureError);
+        }
+      }
+      
+      // Buscar informações do hospital
+      if (order.hospitalId) {
+        try {
+          const hospital = await storage.getHospital(order.hospitalId);
+          if (hospital) {
+            enrichedOrder.hospital = hospital;
+          }
+        } catch (hospitalError) {
+          console.error("Erro ao buscar informações do hospital:", hospitalError);
+        }
+      }
+      
+      // Buscar informações do paciente
+      if (order.patientId) {
+        try {
+          const patient = await storage.getPatient(order.patientId);
+          if (patient) {
+            enrichedOrder.patient = patient;
+          }
+        } catch (patientError) {
+          console.error("Erro ao buscar informações do paciente:", patientError);
+        }
+      }
+      
+      res.json(enrichedOrder);
+    } catch (error) {
+      console.error("Erro ao buscar pedido em andamento:", error);
+      res.status(500).json({ message: "Failed to fetch order in progress" });
+    }
+  });
+  
+  // Rota para obter pedido em andamento (em preenchimento) do usuário específico
+  app.get("/api/medical-orders/in-progress/user/:userId", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      
+      console.log("Buscando pedido em andamento para usuário:", userId);
+      
+      if (isNaN(userId)) {
+        console.log("ID de usuário inválido:", req.params.userId);
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      // Verifica se o usuário está acessando seu próprio pedido ou tem permissão de administrador
+      if (userId !== req.user?.id && !hasPermissionCheck(req, "orders_view")) {
+        console.log("Permissão negada. Usuário logado:", req.user?.id, "Usuário solicitado:", userId);
+        return res.status(403).json({ message: "Permission denied" });
+      }
+      
+      console.log("Chamando storage.getMedicalOrderInProgressByUser com userId:", userId);
+      const order = await storage.getMedicalOrderInProgressByUser(userId);
+      console.log("Resultado da consulta:", order ? "Pedido encontrado" : "Nenhum pedido encontrado");
+      
+      if (!order) {
+        return res.status(404).json({ message: "No order in progress found for this user" });
+      }
+      
+      res.json(order);
+    } catch (error) {
+      console.error("Erro ao buscar pedido em andamento:", error);
+      res.status(500).json({ message: "Failed to fetch order in progress" });
+    }
+  });
+  
+  // Rota para obter pedido em andamento (em preenchimento) para um paciente específico
+  app.get("/api/medical-orders/in-progress/patient/:patientId", isAuthenticated, async (req, res) => {
+    try {
+      const patientId = parseInt(req.params.patientId);
+      const userId = req.user?.id;
+      
+      if (!userId) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      
+      if (isNaN(patientId)) {
+        console.log("ID de paciente inválido:", req.params.patientId);
+        return res.status(400).json({ message: "Invalid patient ID" });
+      }
+      
+      console.log(`Buscando pedido em andamento para paciente ID: ${patientId} solicitado pelo usuário ID: ${userId}`);
+      
+      // Primeiro verificamos se o paciente existe
+      const patient = await storage.getPatient(patientId);
+      if (!patient) {
+        return res.status(404).json({ message: "Patient not found" });
+      }
+      
+      // Buscar todos os pedidos do paciente
+      const allOrders = await storage.getMedicalOrdersForPatient(patientId);
+      
+      // Filtrar para obter apenas os pedidos em preenchimento
+      // Se houver múltiplos, ordenamos pela data de atualização e pegamos o mais recente
+      const ordersInProgress = allOrders
+        .filter(order => order.status === "em_preenchimento")
+        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+      
+      if (ordersInProgress.length === 0) {
+        console.log(`Nenhum pedido em andamento encontrado para o paciente ID: ${patientId}`);
+        return res.status(404).json({ message: "No order in progress found for this patient" });
+      }
+      
+      // Pegar o pedido mais recente
+      const order = ordersInProgress[0];
+      console.log(`Pedido em andamento encontrado para o paciente ID: ${patientId}: Pedido ID ${order.id}`);
+      
+      // Enriquecer o pedido médico com dados relacionados
+      const enrichedOrder: any = { ...order };
+      
+      // Buscar informações completas do CID se um ID foi fornecido
+      if (order.cidCodeId) {
+        try {
+          const cidCode = await storage.getCidCode(order.cidCodeId);
+          if (cidCode) {
+            enrichedOrder.cidCode = cidCode.code;
+            enrichedOrder.cidDescription = cidCode.description;
+            enrichedOrder.cidCodeFull = cidCode;
+          }
+        } catch (cidError) {
+          console.error("Erro ao buscar informações do CID:", cidError);
+        }
+      }
+      
+      // Buscar informações completas do procedimento CBHPM se um ID foi fornecido
+      if (order.procedureCbhpmId) {
+        try {
+          const procedure = await storage.getProcedure(order.procedureCbhpmId);
+          if (procedure) {
+            enrichedOrder.procedureFull = procedure;
+          }
+        } catch (procError) {
+          console.error("Erro ao buscar informações do procedimento:", procError);
+        }
+      }
+      
+      // Buscar itens OPME associados
+      try {
+        const orderItems = await storage.getOrderItems(order.id);
+        console.log("Itens do pedido recuperados:", orderItems);
+        if (orderItems && orderItems.length > 0) {
+          enrichedOrder.items = orderItems;
+        }
+      } catch (itemsError) {
+        console.error("Erro ao buscar itens do pedido:", itemsError);
+      }
+      
+      res.json(enrichedOrder);
+    } catch (error) {
+      console.error("Erro ao buscar pedido em andamento para o paciente:", error);
+      res.status(500).json({ message: "Failed to fetch order in progress for patient" });
+    }
+  });
+  
+  // Rota para atualizar status de um pedido médico
+  app.patch("/api/medical-orders/:id/status", isAuthenticated, hasPermission("orders_edit"), async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "Invalid order ID" });
+      }
+      
+      // Validação do status
+      const statusSchema = z.object({
+        status: z.enum(["em_avaliacao", "aceito", "recusado"])
+      });
+      const { status } = statusSchema.parse(req.body);
+      
+      const order = await storage.getMedicalOrder(orderId);
+      if (!order) {
+        return res.status(404).json({ message: "Medical order not found" });
+      }
+      
+      // Armazenar o status antigo antes de atualizar
+      const oldStatus = order.status;
+      
+      const updatedOrder = await storage.updateMedicalOrderStatus(orderId, status);
+      
+      // Verificar se a ordem foi atualizada com sucesso
+      if (updatedOrder) {
+        // Notificar sobre a mudança de status via webhook
+        WebhookService.notifyOrderStatusChange(updatedOrder, oldStatus, req.user!.id);
+      }
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid status", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update medical order status" });
+    }
+  });
+
+  // Order items routes
+  app.get("/api/medical-orders/:orderId/items", async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "Invalid order ID" });
+      }
+      
+      const items = await storage.getOrderItems(orderId);
+      res.json(items);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch order items" });
+    }
+  });
+
+  app.post("/api/medical-orders/:orderId/items", async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "Invalid order ID" });
+      }
+      
+      const itemData = insertOrderItemSchema.parse({ ...req.body, orderId });
+      const item = await storage.createOrderItem(itemData);
+      res.status(201).json(item);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid order item data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create order item" });
+    }
+  });
+
+  app.delete("/api/order-items/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid order item ID" });
+      }
+      
+      const deleted = await storage.deleteOrderItem(id);
+      if (!deleted) {
+        return res.status(404).json({ message: "Order item not found" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete order item" });
+    }
+  });
+
+  // Scanned document routes
+  app.post("/api/scanned-documents", async (req, res) => {
+    try {
+      const documentData = insertScannedDocumentSchema.parse(req.body);
+      const document = await storage.saveScannedDocument(documentData);
+      res.status(201).json(document);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid document data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to save scanned document" });
+    }
+  });
+
+  app.get("/api/patients/:patientId/scanned-documents", async (req, res) => {
+    try {
+      const patientId = parseInt(req.params.patientId);
+      if (isNaN(patientId)) {
+        return res.status(400).json({ message: "Invalid patient ID" });
+      }
+      
+      const documents = await storage.getScannedDocuments(patientId);
+      res.json(documents);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch scanned documents" });
+    }
+  });
+
+  // Hospital routes
+  app.get("/api/hospitals", async (req, res) => {
+    try {
+      const hospitals = await storage.getHospitals();
+      res.json(hospitals);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch hospitals" });
+    }
+  });
+
+  app.get("/api/hospitals/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid hospital ID" });
+      }
+      
+      const hospital = await storage.getHospital(id);
+      if (!hospital) {
+        return res.status(404).json({ message: "Hospital not found" });
+      }
+      
+      res.json(hospital);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch hospital" });
+    }
+  });
+
+  app.post("/api/hospitals", async (req, res) => {
+    try {
+      const hospitalData = insertHospitalSchema.parse(req.body);
+      const existingHospital = await storage.getHospitalByCNPJ(hospitalData.cnpj);
+      
+      if (existingHospital) {
+        return res.status(409).json({ message: "Hospital with this CNPJ already exists" });
+      }
+      
+      const hospital = await storage.createHospital(hospitalData);
+      res.status(201).json(hospital);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid hospital data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create hospital" });
+    }
+  });
+
+  app.put("/api/hospitals/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid hospital ID" });
+      }
+      
+      const hospitalData = insertHospitalSchema.partial().parse(req.body);
+      const updatedHospital = await storage.updateHospital(id, hospitalData);
+      
+      if (!updatedHospital) {
+        return res.status(404).json({ message: "Hospital not found" });
+      }
+      
+      res.json(updatedHospital);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid hospital data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update hospital" });
+    }
+  });
+
+  app.delete("/api/hospitals/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid hospital ID" });
+      }
+      
+      const deleted = await storage.deleteHospital(id);
+      if (!deleted) {
+        return res.status(404).json({ message: "Hospital not found" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete hospital" });
+    }
+  });
+  
+  // Rota pública para obter papéis disponíveis para registro
+  app.get("/api/public/roles", async (req, res) => {
+    try {
+      const roles = await storage.getRoles();
+      res.json(roles);
+    } catch (error) {
+      console.error("Error fetching public roles:", error);
+      res.status(500).json({ message: "Falha ao buscar papéis públicos" });
+    }
+  });
+  
+  // Rota para alteração de senha do usuário
+  app.post("/api/change-password", isAuthenticated, async (req, res) => {
+    try {
+      const { currentPassword, newPassword } = req.body;
+      
+      if (!currentPassword || !newPassword) {
+        return res.status(400).json({ message: "Senha atual e nova senha são obrigatórias" });
+      }
+      
+      const userId = (req.user as any).id;
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Verificar se a senha atual está correta
+      const isPasswordValid = await comparePasswords(currentPassword, user.password);
+      if (!isPasswordValid) {
+        return res.status(401).json({ message: "Senha atual incorreta" });
+      }
+      
+      // Hash da nova senha
+      const hashedPassword = await hashPasswordLocal(newPassword);
+      
+      // Atualizar a senha do usuário
+      const updatedUser = await storage.updateUser(user.id, {
+        password: hashedPassword
+      });
+      
+      if (!updatedUser) {
+        return res.status(500).json({ message: "Falha ao atualizar a senha" });
+      }
+      
+      res.json({ message: "Senha alterada com sucesso" });
+    } catch (error) {
+      console.error("Erro ao alterar senha:", error);
+      res.status(500).json({ message: "Falha ao alterar a senha" });
+    }
+  });
+
+  // Rotas para gerenciamento de papéis (roles)
+  app.get("/api/roles", isAuthenticated, async (req, res) => {
+    try {
+      const roles = await storage.getRoles();
+      res.json(roles);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar papéis" });
+    }
+  });
+
+  app.get("/api/roles/:id", isAuthenticated, hasPermission("roles_view"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const role = await storage.getRole(id);
+      if (!role) {
+        return res.status(404).json({ message: "Papel não encontrado" });
+      }
+      
+      res.json(role);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar papel" });
+    }
+  });
+
+  app.post("/api/roles", isAuthenticated, hasPermission("roles_create"), async (req, res) => {
+    try {
+      const roleData = insertRoleSchema.parse(req.body);
+      const role = await storage.createRole(roleData);
+      res.status(201).json(role);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de papel inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao criar papel" });
+    }
+  });
+
+  app.put("/api/roles/:id", isAuthenticated, hasPermission("roles_edit"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const roleData = insertRoleSchema.partial().parse(req.body);
+      const updatedRole = await storage.updateRole(id, roleData);
+      
+      if (!updatedRole) {
+        return res.status(404).json({ message: "Papel não encontrado" });
+      }
+      
+      res.json(updatedRole);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de papel inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao atualizar papel" });
+    }
+  });
+
+  app.delete("/api/roles/:id", isAuthenticated, hasPermission("roles_delete"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const deleted = await storage.deleteRole(id);
+      if (!deleted) {
+        return res.status(404).json({ message: "Papel não encontrado" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao excluir papel" });
+    }
+  });
+
+  // Rota para obter todas as permissões disponíveis
+  app.get("/api/permissions", isAuthenticated, async (req, res) => {
+    try {
+      // Lista de todas as permissões disponíveis no sistema
+      const permissions = [
+        // Módulos principais
+        "dashboard_view",
+        "patients_view", "patients_create", "patients_edit", "patients_delete",
+        "hospitals_view", "hospitals_create", "hospitals_edit", "hospitals_delete",
+        "orders_view", "orders_create", "orders_edit", "orders_delete", 
+        "catalog_view", "catalog_create", "catalog_edit", "catalog_delete",
+        "reports_view", "reports_create", "reports_export",
+        // Módulos administrativos
+        "users_view", "users_create", "users_edit", "users_delete",
+        "roles_view", "roles_create", "roles_edit", "roles_delete",
+        "system_settings"
+      ];
+      
+      res.json(permissions);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar permissões disponíveis" });
+    }
+  });
+
+  // Rotas para permissões de papel
+  app.get("/api/roles/:roleId/permissions", isAuthenticated, async (req, res) => {
+    try {
+      const roleId = parseInt(req.params.roleId);
+      if (isNaN(roleId)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const permissions = await storage.getRolePermissions(roleId);
+      res.json(permissions);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar permissões do papel" });
+    }
+  });
+  
+  // Rota pública para permissões de papel
+  app.get("/api/public/roles/:roleId/permissions", async (req, res) => {
+    try {
+      const roleId = parseInt(req.params.roleId);
+      if (isNaN(roleId)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const permissions = await storage.getRolePermissions(roleId);
+      res.json(permissions);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar permissões do papel" });
+    }
+  });
+
+  app.post("/api/roles/:roleId/permissions", isAuthenticated, hasPermission("roles_edit"), async (req, res) => {
+    try {
+      const roleId = parseInt(req.params.roleId);
+      if (isNaN(roleId)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const permissionData = insertRolePermissionSchema.parse({ ...req.body, roleId });
+      const permission = await storage.addRolePermission(permissionData);
+      res.status(201).json(permission);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de permissão inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao adicionar permissão ao papel" });
+    }
+  });
+
+  app.delete("/api/roles/:roleId/permissions/:permission", isAuthenticated, hasPermission("roles_edit"), async (req, res) => {
+    try {
+      const roleId = parseInt(req.params.roleId);
+      if (isNaN(roleId)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const permission = req.params.permission;
+      const deleted = await storage.removeRolePermission(roleId, permission);
+      if (!deleted) {
+        return res.status(404).json({ message: "Permissão não encontrada" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao remover permissão do papel" });
+    }
+  });
+  
+  // Novo endpoint para atualizar todas as permissões de um papel de uma vez
+  app.post("/api/roles/:roleId/permissions/update", isAuthenticated, hasPermission("roles_edit"), async (req, res) => {
+    try {
+      const roleId = parseInt(req.params.roleId);
+      if (isNaN(roleId)) {
+        return res.status(400).json({ message: "ID do papel inválido" });
+      }
+      
+      const { permissions } = req.body;
+      if (!Array.isArray(permissions)) {
+        return res.status(400).json({ message: "O corpo da requisição deve conter um array de permissões" });
+      }
+      
+      // 1. Pegar todas as permissões atuais do papel
+      const currentPermissions = await storage.getRolePermissions(roleId);
+      const currentPermissionNames = currentPermissions.map(p => p.permission);
+      
+      // 2. Remover permissões que não estão mais na lista
+      for (const permission of currentPermissionNames) {
+        if (!permissions.includes(permission)) {
+          await storage.removeRolePermission(roleId, permission);
+        }
+      }
+      
+      // 3. Adicionar novas permissões
+      for (const permission of permissions) {
+        if (!currentPermissionNames.includes(permission)) {
+          await storage.addRolePermission({
+            roleId,
+            permission
+          });
+        }
+      }
+      
+      res.status(200).json({ success: true, message: "Permissões atualizadas com sucesso" });
+    } catch (error) {
+      console.error("Erro ao atualizar permissões:", error);
+      res.status(500).json({ message: "Falha ao atualizar permissões do papel" });
+    }
+  });
+  
+  // Rotas para gerenciamento de usuários
+  app.get("/api/users", isAuthenticated, async (req, res) => {
+    try {
+      const currentUser = req.user;
+      
+      if (!currentUser) {
+        return res.status(401).json({ message: "Usuário não autenticado" });
+      }
+      
+      let users = await storage.getUsers();
+      
+      // Se não for administrador, filtrar apenas usuários do mesmo papel ou apenas ele mesmo
+      const isAdmin = currentUser.roleId === 1;
+      if (!isAdmin) {
+        // Para não administradores, mostrar apenas usuários do mesmo papel ou ativos
+        users = users.filter(user => 
+          user.id === currentUser.id || 
+          (user.roleId === currentUser.roleId && user.active)
+        );
+      }
+      
+      // Remove as senhas dos dados retornados
+      const usersWithoutPasswords = users.map(({ password, ...user }) => user);
+      
+      res.json(usersWithoutPasswords);
+    } catch (error) {
+      console.error("Erro ao buscar usuários:", error);
+      res.status(500).json({ message: "Falha ao buscar usuários" });
+    }
+  });
+  
+  app.get("/api/users/:id", isAuthenticated, hasPermission("users_view"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      const user = await storage.getUser(id);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Remove a senha dos dados retornados
+      const { password, ...userWithoutPassword } = user;
+      
+      res.json(userWithoutPassword);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar usuário" });
+    }
+  });
+  
+  app.put("/api/users/:id", isAuthenticated, hasPermission("users_edit"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      // Permitir a atualização parcial, exceto a senha que requer tratamento especial
+      const { password, ...otherFields } = req.body;
+      
+      // Validar os campos enviados (exceto senha)
+      const userData = insertUserSchema.partial().omit({ password: true }).parse(otherFields);
+      
+      // Verificar se o usuário existe
+      const existingUser = await storage.getUser(id);
+      if (!existingUser) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Criar o objeto de atualização
+      let updateData = userData as any;
+      
+      // Se houver senha, trate-a separadamente com hash
+      if (password && password.trim() !== "") {
+        const hashedPassword = await hashPasswordLocal(password);
+        updateData = {
+          ...updateData,
+          password: hashedPassword
+        };
+      }
+      
+      const updatedUser = await storage.updateUser(id, updateData);
+      
+      if (!updatedUser) {
+        return res.status(404).json({ message: "Falha ao atualizar usuário" });
+      }
+      
+      // Remove a senha dos dados retornados
+      const { password: pwd, ...userWithoutPassword } = updatedUser;
+      
+      res.json(userWithoutPassword);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de usuário inválidos", errors: error.errors });
+      }
+      console.error("Erro ao atualizar usuário:", error);
+      res.status(500).json({ message: "Falha ao atualizar usuário" });
+    }
+  });
+  
+  app.delete("/api/users/:id", isAuthenticated, hasPermission("users_delete"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      // Verificar se o usuário é administrador (roleId = 1)
+      if (req.user && req.user.roleId !== 1) {
+        return res.status(403).json({ message: "Apenas administradores podem excluir usuários" });
+      }
+      
+      const deleted = await storage.deleteUser(id);
+      if (!deleted) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao excluir usuário" });
+    }
+  });
+  
+  // Rotas para permissões de usuário
+  app.get("/api/users/:userId/permissions", isAuthenticated, hasPermission("users_view"), async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      const permissions = await storage.getUserPermissions(userId);
+      res.json(permissions);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar permissões do usuário" });
+    }
+  });
+  
+  app.post("/api/users/:userId/permissions", isAuthenticated, hasPermission("users_edit"), async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      const permissionData = insertUserPermissionSchema.parse({ ...req.body, userId });
+      const permission = await storage.addUserPermission(permissionData);
+      res.status(201).json(permission);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de permissão inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao adicionar permissão ao usuário" });
+    }
+  });
+
+  // Rotas para gerenciamento de vínculos médico-hospital
+  app.get("/api/users/:userId/hospitals", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      // Verifica se o usuário está acessando seus próprios dados ou tem permissão de administrador
+      if (userId !== req.user?.id && !hasPermissionCheck(req, "users_view")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      const doctorHospitals = await storage.getDoctorHospitals(userId);
+      
+      // Para cada vínculo, recuperar os dados completos do hospital
+      const enrichedData = await Promise.all(
+        doctorHospitals.map(async (dh) => {
+          const hospital = await storage.getHospital(dh.hospitalId);
+          return {
+            id: dh.id,
+            userId: dh.userId,
+            hospitalId: dh.hospitalId,
+            hospital: hospital || undefined,
+            createdAt: dh.createdAt
+          };
+        })
+      );
+      
+      res.json(enrichedData);
+    } catch (error) {
+      console.error("Erro ao buscar hospitais do médico:", error);
+      res.status(500).json({ message: "Falha ao buscar hospitais associados ao médico" });
+    }
+  });
+  
+  app.post("/api/users/:userId/hospitals", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      // Verifica se o usuário está gerenciando seus próprios dados ou tem permissão de administrador
+      if (userId !== req.user?.id && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Validar o corpo da requisição
+      const { hospitalId } = req.body;
+      if (!hospitalId || typeof hospitalId !== 'number') {
+        return res.status(400).json({ message: "ID do hospital inválido" });
+      }
+      
+      // Verificar se o hospital existe
+      const hospital = await storage.getHospital(hospitalId);
+      if (!hospital) {
+        return res.status(404).json({ message: "Hospital não encontrado" });
+      }
+      
+      // Adicionar vínculo
+      const insertData = {
+        userId,
+        hospitalId
+      };
+      
+      const result = await storage.addDoctorHospital(insertData);
+      res.status(201).json(result);
+    } catch (error) {
+      console.error("Erro ao adicionar hospital ao médico:", error);
+      res.status(500).json({ message: "Falha ao associar hospital ao médico" });
+    }
+  });
+  
+  app.delete("/api/users/:userId/hospitals/:hospitalId", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      const hospitalId = parseInt(req.params.hospitalId);
+      
+      if (isNaN(userId) || isNaN(hospitalId)) {
+        return res.status(400).json({ message: "IDs inválidos" });
+      }
+      
+      // Verifica se o usuário está gerenciando seus próprios dados ou tem permissão de administrador
+      if (userId !== req.user?.id && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      await storage.removeDoctorHospital(userId, hospitalId);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erro ao remover hospital do médico:", error);
+      res.status(500).json({ message: "Falha ao remover associação entre médico e hospital" });
+    }
+  });
+  
+  app.put("/api/users/:userId/hospitals", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      // Verifica se o usuário está gerenciando seus próprios dados ou tem permissão de administrador
+      if (userId !== req.user?.id && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Validar o corpo da requisição
+      const { hospitalIds } = req.body;
+      if (!Array.isArray(hospitalIds)) {
+        return res.status(400).json({ message: "Lista de hospitais inválida" });
+      }
+      
+      // Atualize todos os vínculos de uma vez
+      const results = await storage.updateDoctorHospitals(userId, hospitalIds);
+      res.json(results);
+    } catch (error) {
+      console.error("Erro ao atualizar hospitais do médico:", error);
+      res.status(500).json({ message: "Falha ao atualizar hospitais do médico" });
+    }
+  });
+  
+  app.delete("/api/users/:userId/permissions/:permission", isAuthenticated, hasPermission("users_edit"), async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID do usuário inválido" });
+      }
+      
+      const permission = req.params.permission;
+      const deleted = await storage.removeUserPermission(userId, permission);
+      if (!deleted) {
+        return res.status(404).json({ message: "Permissão não encontrada" });
+      }
+      
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao remover permissão do usuário" });
+    }
+  });
+
+  // Rota para validar CRM
+  app.get("/api/validate-crm", async (req, res) => {
+    try {
+      const crmStr = req.query.crm as string;
+      
+      if (!crmStr) {
+        return res.status(400).json({ 
+          valid: false, 
+          message: "CRM não informado ou inválido" 
+        });
+      }
+      
+      // Log para debug
+      console.log("Validando CRM:", crmStr);
+      console.log("Tipo do CRM:", typeof crmStr);
+      
+      // Simular um pequeno atraso para demonstrar a animação de carregamento
+      await new Promise(resolve => setTimeout(resolve, 800));
+      
+      // Buscar nos médicos simulados
+      const mockedDoctors = getMockedDoctors();
+      console.log("Médicos disponíveis:", mockedDoctors);
+      
+      const doctor = mockedDoctors.find(d => d.crm === crmStr);
+      
+      if (doctor) {
+        return res.json({
+          valid: true,
+          name: doctor.name,
+          crm: doctor.crm,
+          city: doctor.city,
+          state: doctor.state
+        });
+      } else {
+        return res.json({
+          valid: false,
+          message: "CRM não encontrado"
+        });
+      }
+    } catch (error) {
+      console.error("Erro ao validar CRM:", error);
+      res.status(500).json({ 
+        valid: false, 
+        message: "Erro ao processar a validação do CRM" 
+      });
+    }
+  });
+
+  // Rotas para gerenciamento de códigos CID-10
+  app.get("/api/cid-codes", async (req, res) => {
+    try {
+      const category = req.query.category as string;
+      const term = req.query.search as string;
+      
+      let cidCodes;
+      if (term) {
+        cidCodes = await storage.searchCidCodes(term);
+      } else if (category) {
+        cidCodes = await storage.getCidCodesByCategory(category);
+      } else {
+        cidCodes = await storage.getCidCodes();
+      }
+      
+      res.json(cidCodes);
+    } catch (error) {
+      console.error("Erro ao buscar códigos CID-10:", error);
+      res.status(500).json({ message: "Falha ao buscar códigos CID-10" });
+    }
+  });
+
+  app.get("/api/cid-codes/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID inválido" });
+      }
+      
+      const cidCode = await storage.getCidCode(id);
+      if (!cidCode) {
+        return res.status(404).json({ message: "Código CID-10 não encontrado" });
+      }
+      
+      res.json(cidCode);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar código CID-10" });
+    }
+  });
+
+  app.get("/api/cid-codes/code/:code", async (req, res) => {
+    try {
+      const code = req.params.code;
+      
+      const cidCode = await storage.getCidCodeByCode(code);
+      if (!cidCode) {
+        return res.status(404).json({ message: "Código CID-10 não encontrado" });
+      }
+      
+      res.json(cidCode);
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao buscar código CID-10" });
+    }
+  });
+
+  app.post("/api/cid-codes", isAuthenticated, hasPermission("catalog_manage"), async (req, res) => {
+    try {
+      const cidCodeData = insertCidCodeSchema.parse(req.body);
+      
+      // Verificar se já existe um código com o mesmo valor
+      const existingCode = await storage.getCidCodeByCode(cidCodeData.code);
+      if (existingCode) {
+        return res.status(400).json({ message: "Código CID-10 já existe" });
+      }
+      
+      const newCidCode = await storage.createCidCode(cidCodeData);
+      res.status(201).json(newCidCode);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao criar código CID-10" });
+    }
+  });
+
+  app.put("/api/cid-codes/:id", isAuthenticated, hasPermission("catalog_manage"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID inválido" });
+      }
+      
+      const cidCode = await storage.getCidCode(id);
+      if (!cidCode) {
+        return res.status(404).json({ message: "Código CID-10 não encontrado" });
+      }
+      
+      const cidCodeData = insertCidCodeSchema.partial().parse(req.body);
+      
+      // Se estiver tentando mudar o código, verificar se já existe um com o mesmo valor
+      if (cidCodeData.code && cidCodeData.code !== cidCode.code) {
+        const existingCode = await storage.getCidCodeByCode(cidCodeData.code);
+        if (existingCode && existingCode.id !== id) {
+          return res.status(400).json({ message: "Código CID-10 já existe" });
+        }
+      }
+      
+      const updatedCidCode = await storage.updateCidCode(id, cidCodeData);
+      res.json(updatedCidCode);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados inválidos", errors: error.errors });
+      }
+      res.status(500).json({ message: "Falha ao atualizar código CID-10" });
+    }
+  });
+
+  app.delete("/api/cid-codes/:id", isAuthenticated, hasPermission("catalog_manage"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID inválido" });
+      }
+      
+      const cidCode = await storage.getCidCode(id);
+      if (!cidCode) {
+        return res.status(404).json({ message: "Código CID-10 não encontrado" });
+      }
+      
+      await storage.deleteCidCode(id);
+      res.status(204).end();
+    } catch (error) {
+      res.status(500).json({ message: "Falha ao excluir código CID-10" });
+    }
+  });
+
+  // Rotas para Fornecedores (Suppliers)
+  app.get("/api/suppliers", async (req, res) => {
+    try {
+      // Por padrão, retorna apenas os fornecedores ativos
+      const showAll = req.query.showAll === "true";
+      
+      const suppliers = showAll 
+        ? await storage.getSuppliers()
+        : await storage.getActiveSuppliers();
+      
+      res.json(suppliers);
+    } catch (error) {
+      console.error("Erro ao buscar fornecedores:", error);
+      res.status(500).json({ message: "Falha ao buscar fornecedores" });
+    }
+  });
+  
+  app.get("/api/suppliers/search", async (req, res) => {
+    try {
+      const term = req.query.q as string;
+      
+      if (!term || term.trim().length < 2) {
+        return res.status(400).json({ message: "Termo de busca deve ter pelo menos 2 caracteres" });
+      }
+      
+      const results = await storage.searchSuppliers(term);
+      res.json(results);
+    } catch (error) {
+      console.error("Erro ao buscar fornecedores:", error);
+      res.status(500).json({ message: "Falha ao buscar fornecedores" });
+    }
+  });
+  
+  app.get("/api/suppliers/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      const supplier = await storage.getSupplier(id);
+      
+      if (!supplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      res.json(supplier);
+    } catch (error) {
+      console.error("Erro ao buscar fornecedor:", error);
+      res.status(500).json({ message: "Falha ao buscar fornecedor" });
+    }
+  });
+  
+  app.post("/api/suppliers", async (req, res) => {
+    try {
+      // Validar os dados do fornecedor usando o schema
+      const supplierData = insertSupplierSchema.parse(req.body);
+      
+      // Verificar se já existe um fornecedor com o mesmo CNPJ
+      const existingSupplier = await storage.getSupplierByCnpj(supplierData.cnpj);
+      
+      if (existingSupplier) {
+        return res.status(409).json({ 
+          message: "Já existe um fornecedor com este CNPJ",
+          supplier: existingSupplier 
+        });
+      }
+      
+      // Criar o fornecedor
+      const supplier = await storage.createSupplier(supplierData);
+      
+      res.status(201).json(supplier);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Dados de fornecedor inválidos", 
+          errors: error.errors 
+        });
+      }
+      
+      console.error("Erro ao criar fornecedor:", error);
+      res.status(500).json({ message: "Falha ao criar fornecedor" });
+    }
+  });
+  
+  app.put("/api/suppliers/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      // Verificar se o fornecedor existe
+      const existingSupplier = await storage.getSupplier(id);
+      
+      if (!existingSupplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      // Validar os dados de atualização
+      const updates = insertSupplierSchema.partial().parse(req.body);
+      
+      // Se o CNPJ foi alterado, verificar se já existe outro fornecedor com o mesmo CNPJ
+      if (updates.cnpj && updates.cnpj !== existingSupplier.cnpj) {
+        const supplierWithSameCNPJ = await storage.getSupplierByCnpj(updates.cnpj);
+        
+        if (supplierWithSameCNPJ && supplierWithSameCNPJ.id !== id) {
+          return res.status(409).json({ 
+            message: "Já existe outro fornecedor com este CNPJ",
+            supplier: supplierWithSameCNPJ
+          });
+        }
+      }
+      
+      // Atualizar o fornecedor
+      const updatedSupplier = await storage.updateSupplier(id, updates);
+      
+      res.json(updatedSupplier);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Dados de fornecedor inválidos", 
+          errors: error.errors 
+        });
+      }
+      
+      console.error("Erro ao atualizar fornecedor:", error);
+      res.status(500).json({ message: "Falha ao atualizar fornecedor" });
+    }
+  });
+  
+  app.delete("/api/suppliers/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      // Verificar se o fornecedor existe
+      const existingSupplier = await storage.getSupplier(id);
+      
+      if (!existingSupplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      // Excluir o fornecedor (ou marcar como inativo)
+      const success = await storage.deleteSupplier(id);
+      
+      if (success) {
+        res.sendStatus(204); // No Content
+      } else {
+        res.status(500).json({ message: "Falha ao excluir fornecedor" });
+      }
+    } catch (error) {
+      console.error("Erro ao excluir fornecedor:", error);
+      res.status(500).json({ message: "Falha ao excluir fornecedor" });
+    }
+  });
+
+  // Rotas de Notificações
+  
+  // Obter notificações do usuário
+  app.get("/api/notifications", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user!.id;
+      const notifications = await storage.getNotifications(userId);
+      res.json(notifications);
+    } catch (error) {
+      console.error("Erro ao buscar notificações:", error);
+      res.status(500).json({ message: "Falha ao buscar notificações" });
+    }
+  });
+
+  // Obter contagem de notificações não lidas
+  app.get("/api/notifications/unread-count", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user!.id;
+      const count = await storage.getUnreadNotificationsCount(userId);
+      res.json({ count });
+    } catch (error) {
+      console.error("Erro ao contar notificações:", error);
+      res.status(500).json({ message: "Falha ao contar notificações não lidas" });
+    }
+  });
+
+  // Marcar notificação como lida
+  app.patch("/api/notifications/:id/read", isAuthenticated, async (req, res) => {
+    try {
+      const notificationId = parseInt(req.params.id);
+      if (isNaN(notificationId)) {
+        return res.status(400).json({ message: "ID de notificação inválido" });
+      }
+      
+      const updatedNotification = await storage.markNotificationAsRead(notificationId);
+      if (!updatedNotification) {
+        return res.status(404).json({ message: "Notificação não encontrada" });
+      }
+      
+      res.json(updatedNotification);
+    } catch (error) {
+      console.error("Erro ao marcar notificação como lida:", error);
+      res.status(500).json({ message: "Falha ao atualizar notificação" });
+    }
+  });
+
+  // Marcar todas as notificações como lidas
+  app.post("/api/notifications/mark-all-read", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user!.id;
+      await storage.markAllNotificationsAsRead(userId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Erro ao marcar todas notificações como lidas:", error);
+      res.status(500).json({ message: "Falha ao atualizar notificações" });
+    }
+  });
+
+  // Criar nova notificação (apenas para administradores)
+  app.post("/api/notifications", isAuthenticated, hasPermission("notifications_manage"), async (req, res) => {
+    try {
+      const notificationData = insertNotificationSchema.parse(req.body);
+      const notification = await storage.createNotification(notificationData);
+      res.status(201).json(notification);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de notificação inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar notificação:", error);
+      res.status(500).json({ message: "Falha ao criar notificação" });
+    }
+  });
+
+  // Excluir notificação
+  app.delete("/api/notifications/:id", isAuthenticated, async (req, res) => {
+    try {
+      const notificationId = parseInt(req.params.id);
+      if (isNaN(notificationId)) {
+        return res.status(400).json({ message: "ID de notificação inválido" });
+      }
+      
+      await storage.deleteNotification(notificationId);
+      res.sendStatus(204);
+    } catch (error) {
+      console.error("Erro ao excluir notificação:", error);
+      res.status(500).json({ message: "Falha ao excluir notificação" });
+    }
+  });
+
+  // Rotas do "Fale Conosco"
+  // Rota pública para criar mensagens (não requer autenticação)
+  app.post("/api/contact", async (req, res) => {
+    try {
+      const messageData = insertContactMessageSchema.parse(req.body);
+      
+      // Associa o usuário se estiver autenticado
+      if (req.isAuthenticated() && req.user) {
+        messageData.userId = req.user.id;
+      }
+      
+      const message = await storage.createContactMessage(messageData);
+      res.status(201).json(message);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de contato inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar mensagem de contato:", error);
+      res.status(500).json({ message: "Falha ao enviar mensagem de contato" });
+    }
+  });
+
+  // Rota para listar todas as mensagens (requer permissão de admin)
+  app.get("/api/contact", isAuthenticated, hasPermission("messages.view"), async (req, res) => {
+    try {
+      const messages = await storage.getContactMessages();
+      res.json(messages);
+    } catch (error) {
+      console.error("Erro ao listar mensagens de contato:", error);
+      res.status(500).json({ message: "Falha ao listar mensagens de contato" });
+    }
+  });
+
+  // Rota para listar apenas mensagens pendentes (requer permissão de admin)
+  app.get("/api/contact/pending", isAuthenticated, hasPermission("messages.view"), async (req, res) => {
+    try {
+      const pendingMessages = await storage.getPendingContactMessages();
+      res.json(pendingMessages);
+    } catch (error) {
+      console.error("Erro ao listar mensagens pendentes:", error);
+      res.status(500).json({ message: "Falha ao listar mensagens pendentes" });
+    }
+  });
+
+  // Rota para obter uma mensagem específica (requer permissão de admin)
+  app.get("/api/contact/:id", isAuthenticated, hasPermission("messages.view"), async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de mensagem inválido" });
+      }
+      
+      const message = await storage.getContactMessage(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Mensagem não encontrada" });
+      }
+      
+      res.json(message);
+    } catch (error) {
+      console.error("Erro ao obter mensagem de contato:", error);
+      res.status(500).json({ message: "Falha ao obter mensagem de contato" });
+    }
+  });
+  
+  // Rota para obter dados de pedidos para relatórios
+  app.get("/api/reports/stats", isAuthenticated, async (req, res) => {
+    try {
+      // Verificar se o usuário é admin
+      const isAdmin = req.user?.roleId === 1;
+      
+      if (!isAdmin) {
+        return res.status(403).json({ message: "Acesso não autorizado" });
+      }
+      
+      // Retornar estatísticas de exemplo para a visualização 
+      const stats = {
+        totalOrders: 248,
+        totalPatients: 187,
+        ordersPerDoctor: [
+          { name: "Dr. Ricardo Silva", value: 42 },
+          { name: "Dra. Maria Santos", value: 38 },
+          { name: "Dr. Carlos Mendes", value: 29 },
+          { name: "Dr. Antônio Ferreira", value: 25 },
+          { name: "Dr. Felipe Corrêa", value: 18 }
+        ],
+        ordersPerHospital: [
+          { name: "Hospital São Lucas", value: 75 },
+          { name: "Hospital Santa Teresa", value: 55 },
+          { name: "Hospital Central", value: 45 },
+          { name: "Hospital Universitário", value: 40 },
+          { name: "Outros", value: 35 }
+        ]
+      };
+      
+      res.json(stats);
+    } catch (error) {
+      console.error("Erro ao obter estatísticas:", error);
+      res.status(500).json({ message: "Erro ao obter estatísticas" });
+    }
+  });
+  
+  // Rota para obter dados de pedidos para relatórios
+  app.get("/api/reports/orders", isAuthenticated, async (req, res) => {
+    try {
+      // Verificar se o usuário é admin para determinar quais dados retornar
+      const isAdmin = req.user?.roleId === 1;
+      
+      // No ambiente real, usaríamos uma função para buscar os dados do banco de dados
+      // mas vamos retornar dados de exemplo formatados conforme o frontend espera
+      const sampleOrders = [
+        {
+          id: 1,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          status: "em_avaliacao",
+          patientName: "João da Silva",
+          hospitalName: "Hospital São Lucas",
+          procedureName: "Artroscopia de Joelho",
+          procedureDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          userName: req.user?.name || "Usuário"
+        },
+        {
+          id: 2,
+          createdAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+          updatedAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
+          status: "aceito",
+          patientName: "Maria Oliveira",
+          hospitalName: "Hospital Santa Teresa",
+          procedureName: "Prótese Total de Quadril",
+          procedureDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+          userName: req.user?.name || "Usuário"
+        },
+        {
+          id: 3,
+          createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+          updatedAt: new Date(Date.now() - 28 * 24 * 60 * 60 * 1000),
+          status: "realizado",
+          patientName: "Carlos Mendes",
+          hospitalName: "Hospital Central",
+          procedureName: "Artrodese de Coluna",
+          procedureDate: new Date(Date.now() - 20 * 24 * 60 * 60 * 1000),
+          userName: req.user?.name || "Usuário"
+        }
+      ];
+      
+      // Adicionar um pedido específico para administradores
+      if (isAdmin) {
+        sampleOrders.push({
+          id: 4,
+          createdAt: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000),
+          updatedAt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000),
+          status: "em_preenchimento",
+          patientName: "Ana Beatriz Costa",
+          hospitalName: "Hospital Universitário",
+          procedureName: "Prótese Total de Joelho",
+          procedureDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          userName: "Dr. Ricardo Almeida"
+        });
+      }
+      
+      res.json(sampleOrders);
+    } catch (error) {
+      console.error("Erro ao obter dados para relatórios:", error);
+      res.status(500).json({ message: "Erro ao obter dados para relatórios" });
+    }
+  });
+        
+      // Formatar os dados para o relatório
+      const formattedData = orders.map(order => {
+        // Buscar informações adicionais se disponíveis
+        const patientName = order.patientName || "Paciente";
+        const procedureName = order.procedureName || "Procedimento";
+        const hospitalName = order.hospitalName || "Hospital";
+        
+        return {
+          id: order.id,
+          createdAt: order.createdAt,
+          updatedAt: order.updatedAt,
+          status: order.status,
+          patientName,
+          procedureName,
+          hospitalName,
+          procedureDate: order.procedureDate,
+          userId: order.userId,
+          userName: user?.name
+        };
+      });
+      
+      res.json(formattedData);
+    } catch (error) {
+      console.error("Erro ao obter dados para relatórios:", error);
+      res.status(500).json({ message: "Erro ao obter dados para relatórios" });
+    }
+  });
+  
+  // Rota para obter estatísticas agregadas para administradores
+  app.get("/api/reports/stats", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user?.id;
+      
+      if (!userId) {
+        return res.status(401).json({ message: "Usuário não autenticado" });
+      }
+      
+      // Verificar se o usuário é admin
+      const user = await storage.getUser(userId);
+      
+      if (user?.roleId !== 1) {
+        return res.status(403).json({ message: "Acesso não autorizado" });
+      }
+      
+      // Buscar estatísticas agregadas
+      const totalOrders = await storage.getOrderCount();
+      const totalPatients = await storage.getPatientCount();
+      const ordersPerDoctor = await storage.getOrderCountByDoctor();
+      const ordersPerHospital = await storage.getOrderCountByHospital();
+      
+      res.json({
+        totalOrders,
+        totalPatients,
+        ordersPerDoctor,
+        ordersPerHospital
+      });
+    } catch (error) {
+      console.error("Erro ao obter estatísticas para relatórios:", error);
+      res.status(500).json({ message: "Erro ao obter estatísticas para relatórios" });
+    }
+  });
+      
+      const message = await storage.getContactMessage(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Mensagem não encontrada" });
+      }
+      
+      res.json(message);
+    } catch (error) {
+      console.error("Erro ao buscar mensagem de contato:", error);
+      res.status(500).json({ message: "Falha ao buscar mensagem de contato" });
+    }
+  });
+
+  // Rota para atualizar o status de uma mensagem (requer permissão de admin)
+  app.patch("/api/contact/:id/status", isAuthenticated, hasPermission("messages.respond"), async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de mensagem inválido" });
+      }
+      
+      const { status } = req.body;
+      if (!status || typeof status !== "string") {
+        return res.status(400).json({ message: "Status inválido" });
+      }
+      
+      const updatedMessage = await storage.updateContactMessageStatus(messageId, status);
+      if (!updatedMessage) {
+        return res.status(404).json({ message: "Mensagem não encontrada" });
+      }
+      
+      res.json(updatedMessage);
+    } catch (error) {
+      console.error("Erro ao atualizar status da mensagem:", error);
+      res.status(500).json({ message: "Falha ao atualizar status da mensagem" });
+    }
+  });
+
+  // Rota para responder uma mensagem (requer permissão de admin)
+  app.post("/api/contact/:id/respond", isAuthenticated, hasPermission("messages.respond"), async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de mensagem inválido" });
+      }
+      
+      const { responseMessage } = req.body;
+      if (!responseMessage || typeof responseMessage !== "string") {
+        return res.status(400).json({ message: "Resposta inválida" });
+      }
+      
+      const updatedMessage = await storage.respondToContactMessage(messageId, responseMessage, req.user!.id);
+      if (!updatedMessage) {
+        return res.status(404).json({ message: "Mensagem não encontrada" });
+      }
+      
+      // Notificar sobre a resposta à mensagem de contato via webhook
+      WebhookService.notifyContactMessageResponse(updatedMessage, req.user!.id);
+      
+      res.json(updatedMessage);
+    } catch (error) {
+      console.error("Erro ao responder mensagem:", error);
+      res.status(500).json({ message: "Falha ao responder mensagem" });
+    }
+  });
+
+  // Rota para excluir uma mensagem (requer permissão de admin)
+  app.delete("/api/contact/:id", isAuthenticated, hasPermission("messages.delete"), async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de mensagem inválido" });
+      }
+      
+      const deleted = await storage.deleteContactMessage(messageId);
+      if (!deleted) {
+        return res.status(404).json({ message: "Mensagem não encontrada" });
+      }
+      
+      res.sendStatus(204);
+    } catch (error) {
+      console.error("Erro ao excluir mensagem:", error);
+      res.status(500).json({ message: "Falha ao excluir mensagem" });
+    }
+  });
+  
+  // API routes para relatórios
+  
+  // Endpoint para obter dados de volume de cirurgias
+  app.get("/api/reports/surgery-volume", isAuthenticated, hasPermission("reports_view"), async (req, res) => {
+    try {
+      const { range = "monthly" } = req.query;
+      let startDate: Date;
+      const endDate = new Date();
+      
+      // Definir a data de início com base no período solicitado
+      switch (range) {
+        case "weekly":
+          startDate = new Date();
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case "monthly":
+          startDate = new Date();
+          startDate.setMonth(startDate.getMonth() - 6);
+          break;
+        case "annual":
+          startDate = new Date();
+          startDate.setFullYear(startDate.getFullYear() - 4);
+          break;
+        default:
+          startDate = new Date();
+          startDate.setMonth(startDate.getMonth() - 6);
+      }
+      
+      // Buscar pedidos médicos no período especificado
+      // Como não temos o método implementado, usamos dados simulados por enquanto
+      // Na implementação real, você deve implementar o método getMedicalOrdersByDateRange
+      // const orders = await storage.getMedicalOrdersByDateRange(startDate, endDate);
+      
+      // Simulação de dados para demonstração
+      let result: any[];
+      
+      if (range === "weekly") {
+        result = [
+          { name: "Seg", solicitadas: 8, realizadas: 5, canceladas: 1 },
+          { name: "Ter", solicitadas: 10, realizadas: 7, canceladas: 2 },
+          { name: "Qua", solicitadas: 12, realizadas: 9, canceladas: 1 },
+          { name: "Qui", solicitadas: 9, realizadas: 6, canceladas: 1 },
+          { name: "Sex", solicitadas: 11, realizadas: 8, canceladas: 0 },
+          { name: "Sáb", solicitadas: 7, realizadas: 5, canceladas: 1 },
+          { name: "Dom", solicitadas: 4, realizadas: 2, canceladas: 0 }
+        ];
+      } else if (range === "monthly") {
+        result = [
+          { name: "Jan", solicitadas: 42, realizadas: 30, canceladas: 5 },
+          { name: "Fev", solicitadas: 38, realizadas: 27, canceladas: 4 },
+          { name: "Mar", solicitadas: 45, realizadas: 35, canceladas: 3 },
+          { name: "Abr", solicitadas: 50, realizadas: 40, canceladas: 4 },
+          { name: "Mai", solicitadas: 48, realizadas: 38, canceladas: 3 },
+          { name: "Jun", solicitadas: 52, realizadas: 42, canceladas: 5 }
+        ];
+      } else {
+        result = [
+          { name: "2022", solicitadas: 450, realizadas: 380, canceladas: 30 },
+          { name: "2023", solicitadas: 520, realizadas: 420, canceladas: 40 },
+          { name: "2024", solicitadas: 580, realizadas: 470, canceladas: 45 },
+          { name: "2025", solicitadas: 380, realizadas: 300, canceladas: 25 }
+        ];
+      }
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de volume de cirurgias:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+  
+  // Endpoint para obter dados de distribuição de tipo de procedimento (eletivas vs urgência)
+  app.get("/api/reports/procedure-type-distribution", isAuthenticated, hasPermission("reports_view"), async (req, res) => {
+    try {
+      // Dados simulados para demonstração
+      const result = [
+        { name: "Eletivas", value: 75 },
+        { name: "Urgência", value: 25 }
+      ];
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de distribuição de tipos de procedimento:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+  
+  // Endpoint para obter dados de distribuição por tipo de cirurgia
+  app.get("/api/reports/procedure-distribution", isAuthenticated, hasPermission("reports_view"), async (req, res) => {
+    try {
+      // Dados simulados para demonstração
+      const result = [
+        { name: "Artroscopia de Ombro", value: 18 },
+        { name: "Artroplastia", value: 22 },
+        { name: "Fraturas", value: 25 },
+        { name: "Infiltrações", value: 12 },
+        { name: "Outros", value: 23 }
+      ];
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de distribuição de procedimentos:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+  
+  // Endpoint para obter dados de distribuição por complexidade/porte
+  app.get("/api/reports/complexity-distribution", isAuthenticated, hasPermission("reports_view"), async (req, res) => {
+    try {
+      // Dados simulados para demonstração
+      const result = [
+        { name: "Porte 1", value: 15 },
+        { name: "Porte 2", value: 25 },
+        { name: "Porte 3", value: 35 },
+        { name: "Porte 4", value: 18 },
+        { name: "Porte 5+", value: 7 }
+      ];
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de distribuição por complexidade:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+  
+  // Endpoint para obter dados de distribuição por convênio
+  app.get("/api/reports/insurance-distribution", isAuthenticated, hasPermission("reports_view"), async (req, res) => {
+    try {
+      // Dados simulados para demonstração
+      const result = [
+        { name: "Bradesco", value: 35 },
+        { name: "Sul América", value: 25 },
+        { name: "Amil", value: 15 },
+        { name: "Unimed", value: 18 },
+        { name: "Outros", value: 7 }
+      ];
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de distribuição por convênio:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+  
+  // Endpoint para obter dados de honorários médicos
+  app.get("/api/reports/medical-fees", isAuthenticated, async (req, res) => {
+    try {
+      // Verificar se o usuário tem permissão específica ou se está consultando seus próprios dados
+      const userId = req.user.id;
+      const targetUserId = parseInt(req.query.userId as string) || userId;
+      
+      if (userId !== targetUserId && !hasPermissionCheck(req, "reports_view")) {
+        return res.status(403).json({ message: "Não autorizado a visualizar dados de outros médicos" });
+      }
+      
+      // Dados simulados para demonstração
+      const result = [
+        { 
+          id: 1, 
+          procedure: "Artroscopia de Joelho", 
+          patient: "João Silva", 
+          date: "15/04/2025", 
+          value: 5800.00, 
+          status: "pago", 
+          paymentDate: "30/04/2025" 
+        },
+        { 
+          id: 2, 
+          procedure: "Artroplastia de Quadril", 
+          patient: "Maria Oliveira", 
+          date: "22/04/2025", 
+          value: 8500.00, 
+          status: "pendente", 
+          paymentDate: "-" 
+        },
+        { 
+          id: 3, 
+          procedure: "Fixação de Fratura", 
+          patient: "Carlos Mendes", 
+          date: "05/05/2025", 
+          value: 4300.00, 
+          status: "glosa", 
+          paymentDate: "-" 
+        },
+        { 
+          id: 4, 
+          procedure: "Infiltração", 
+          patient: "Ana Carolina", 
+          date: "10/05/2025", 
+          value: 1200.00, 
+          status: "pago", 
+          paymentDate: "25/05/2025" 
+        },
+        { 
+          id: 5, 
+          procedure: "Artroscopia de Ombro", 
+          patient: "Paulo Roberto", 
+          date: "18/05/2025", 
+          value: 6200.00, 
+          status: "pendente", 
+          paymentDate: "-" 
+        }
+      ];
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erro ao gerar relatório de honorários médicos:", error);
+      res.status(500).json({ message: "Erro ao gerar relatório" });
+    }
+  });
+
+  // Rota de teste para testar o webhook de mudança de status de ordem médica
+  app.get("/api/test-webhook-order-status/:orderId", async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: "ID de ordem inválido" });
+      }
+
+      // Buscar a ordem atual
+      const order = await storage.getMedicalOrder(orderId);
+      if (!order) {
+        return res.status(404).json({ message: "Ordem médica não encontrada" });
+      }
+
+      // Guardar o status atual
+      const oldStatus = order.status;
+      
+      // Definir o novo status (diferentes do atual)
+      let newStatus = "enviado";
+      if (oldStatus === "enviado") {
+        newStatus = "aprovado";
+      } else if (oldStatus === "aprovado") {
+        newStatus = "rejeitado";
+      }
+
+      // Atualizar o status
+      const updatedOrder = await storage.updateMedicalOrderStatus(orderId, newStatus);
+      
+      // Notificar sobre a mudança via webhook
+      WebhookService.notifyOrderStatusChange(updatedOrder, oldStatus, 21); // ID 21 é o admin
+      
+      res.json({
+        success: true,
+        oldStatus,
+        newStatus,
+        order: updatedOrder
+      });
+    } catch (error) {
+      console.error("Erro ao testar webhook:", error);
+      res.status(500).json({ message: "Falha ao testar webhook", error: error.message });
+    }
+  });
+  
+  // Rota de teste para ativar um usuário específico por username
+  app.get("/api/activate-user/:username", async (req, res) => {
+    try {
+      const username = req.params.username;
+      
+      // Buscar o usuário pelo username
+      const user = await storage.getUserByUsername(username);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Atualizar o usuário para ativo
+      const updatedUser = await storage.updateUser(user.id, { active: true });
+      
+      if (updatedUser) {
+        res.json({
+          success: true,
+          message: `Usuário ${username} ativado com sucesso`,
+          user: updatedUser
+        });
+      } else {
+        res.status(500).json({ message: "Falha ao ativar usuário" });
+      }
+    } catch (error) {
+      console.error("Erro ao ativar usuário:", error);
+      res.status(500).json({ message: "Falha ao ativar usuário", error: error.message });
+    }
+  });
+
+  // API endpoints para estados brasileiros
+  app.get("/api/brazilian-states", async (req, res) => {
+    try {
+      const states = await db.select().from(brazilianStates).orderBy(brazilianStates.name);
+      res.json(states);
+    } catch (error) {
+      console.error("Error fetching Brazilian states:", error);
+      res.status(500).json({ message: "Failed to fetch Brazilian states" });
+    }
+  });
+  
+  app.get("/api/brazilian-states/:stateCode", async (req, res) => {
+    try {
+      const stateCode = req.params.stateCode.toUpperCase();
+      
+      const [state] = await db
+        .select()
+        .from(brazilianStates)
+        .where(eq(brazilianStates.stateCode, stateCode));
+      
+      if (!state) {
+        return res.status(404).json({ message: "State not found" });
+      }
+      
+      res.json(state);
+    } catch (error) {
+      console.error("Error fetching Brazilian state:", error);
+      res.status(500).json({ message: "Failed to fetch Brazilian state" });
+    }
+  });
+  
+  app.get("/api/brazilian-states/region/:region", async (req, res) => {
+    try {
+      const region = req.params.region;
+      
+      const states = await db
+        .select()
+        .from(brazilianStates)
+        .where(eq(brazilianStates.region, region))
+        .orderBy(brazilianStates.name);
+      
+      res.json(states);
+    } catch (error) {
+      console.error("Error fetching Brazilian states by region:", error);
+      res.status(500).json({ message: "Failed to fetch Brazilian states by region" });
+    }
+  });
+  
+  // API endpoints para municípios
+  app.get("/api/municipalities", async (req, res) => {
+    try {
+      const municipalitiesList = await db
+        .select({
+          id: municipalities.id,
+          name: municipalities.name,
+          ibgeCode: municipalities.ibgeCode,
+          stateId: municipalities.stateId,
+          stateName: brazilianStates.name,
+          stateCode: brazilianStates.stateCode
+        })
+        .from(municipalities)
+        .leftJoin(brazilianStates, eq(municipalities.stateId, brazilianStates.id))
+        .orderBy(municipalities.name);
+      
+      res.json(municipalitiesList);
+    } catch (error) {
+      console.error("Error fetching municipalities:", error);
+      res.status(500).json({ message: "Failed to fetch municipalities" });
+    }
+  });
+  
+  app.get("/api/municipalities/by-state/:stateId", async (req, res) => {
+    try {
+      const stateId = parseInt(req.params.stateId);
+      
+      const municipalitiesList = await db
+        .select()
+        .from(municipalities)
+        .where(eq(municipalities.stateId, stateId))
+        .orderBy(municipalities.name);
+      
+      res.json(municipalitiesList);
+    } catch (error) {
+      console.error("Error fetching municipalities by state:", error);
+      res.status(500).json({ message: "Failed to fetch municipalities by state" });
+    }
+  });
+  
+  app.get("/api/municipalities/by-state-code/:stateCode", async (req, res) => {
+    try {
+      const stateCode = req.params.stateCode.toUpperCase();
+      
+      // Primeiro encontrar o estado pelo código
+      const [state] = await db
+        .select()
+        .from(brazilianStates)
+        .where(eq(brazilianStates.stateCode, stateCode));
+      
+      if (!state) {
+        return res.status(404).json({ message: "State not found" });
+      }
+      
+      // Depois buscar municípios pelo ID do estado
+      const municipalitiesList = await db
+        .select()
+        .from(municipalities)
+        .where(eq(municipalities.stateId, state.id))
+        .orderBy(municipalities.name);
+      
+      res.json(municipalitiesList);
+    } catch (error) {
+      console.error("Error fetching municipalities by state code:", error);
+      res.status(500).json({ message: "Failed to fetch municipalities by state code" });
+    }
+  });
+
+  // Rotas para fornecedores (Suppliers)
+  app.get("/api/suppliers", isAuthenticated, async (req, res) => {
+    try {
+      // Opções de filtro
+      const municipalityId = req.query.municipalityId ? parseInt(req.query.municipalityId as string) : undefined;
+      const active = req.query.active === "true" ? true : req.query.active === "false" ? false : undefined;
+      const search = req.query.search as string;
+      
+      const suppliers = await storage.getSuppliers(municipalityId, active, search);
+      res.json(suppliers);
+    } catch (error) {
+      console.error("Erro ao buscar fornecedores:", error);
+      res.status(500).json({ message: "Erro ao buscar fornecedores" });
+    }
+  });
+
+  app.get("/api/suppliers/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      const supplier = await storage.getSupplier(id);
+      if (!supplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      res.json(supplier);
+    } catch (error) {
+      console.error("Erro ao buscar fornecedor:", error);
+      res.status(500).json({ message: "Erro ao buscar fornecedor" });
+    }
+  });
+
+  app.post("/api/suppliers", isAuthenticated, hasPermission("manage_suppliers"), async (req, res) => {
+    try {
+      // Validar os dados de entrada
+      const supplierData = insertSupplierSchema.parse(req.body);
+      
+      // Verificar se o CNPJ já existe
+      const existingSupplier = await storage.getSupplierByCnpj(supplierData.cnpj);
+      if (existingSupplier) {
+        return res.status(400).json({ message: "Já existe um fornecedor com este CNPJ" });
+      }
+      
+      // Verificar se o município existe
+      const municipality = await storage.getMunicipality(supplierData.municipalityId);
+      if (!municipality) {
+        return res.status(400).json({ message: "Município não encontrado" });
+      }
+      
+      // Criar o fornecedor
+      const supplier = await storage.createSupplier(supplierData);
+      
+      // Log da operação 
+      console.log(`Fornecedor ${supplier.tradeName} (ID: ${supplier.id}) criado por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(201).json(supplier);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de fornecedor inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar fornecedor:", error);
+      res.status(500).json({ message: "Erro ao criar fornecedor" });
+    }
+  });
+
+  app.put("/api/suppliers/:id", isAuthenticated, hasPermission("manage_suppliers"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      // Verificar se o fornecedor existe
+      const existingSupplier = await storage.getSupplier(id);
+      if (!existingSupplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      // Validar os dados de entrada
+      const supplierData = insertSupplierSchema.parse(req.body);
+      
+      // Verificar se o CNPJ já existe e não pertence a este fornecedor
+      if (supplierData.cnpj !== existingSupplier.cnpj) {
+        const supplierWithCnpj = await storage.getSupplierByCnpj(supplierData.cnpj);
+        if (supplierWithCnpj && supplierWithCnpj.id !== id) {
+          return res.status(400).json({ message: "Já existe um fornecedor com este CNPJ" });
+        }
+      }
+      
+      // Verificar se o município existe
+      const municipality = await storage.getMunicipality(supplierData.municipalityId);
+      if (!municipality) {
+        return res.status(400).json({ message: "Município não encontrado" });
+      }
+      
+      // Atualizar o fornecedor
+      const updatedSupplier = await storage.updateSupplier(id, supplierData);
+      
+      // Log da operação
+      console.log(`Fornecedor ${updatedSupplier.tradeName} (ID: ${updatedSupplier.id}) atualizado por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.json(updatedSupplier);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de fornecedor inválidos", errors: error.errors });
+      }
+      console.error("Erro ao atualizar fornecedor:", error);
+      res.status(500).json({ message: "Erro ao atualizar fornecedor" });
+    }
+  });
+
+  app.delete("/api/suppliers/:id", isAuthenticated, hasPermission("manage_suppliers"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de fornecedor inválido" });
+      }
+      
+      // Verificar se o fornecedor existe
+      const supplier = await storage.getSupplier(id);
+      if (!supplier) {
+        return res.status(404).json({ message: "Fornecedor não encontrado" });
+      }
+      
+      // Excluir o fornecedor
+      await storage.deleteSupplier(id);
+      
+      // Log da operação
+      console.log(`Fornecedor ${supplier.tradeName} (ID: ${supplier.id}) excluído por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erro ao excluir fornecedor:", error);
+      res.status(500).json({ message: "Erro ao excluir fornecedor" });
+    }
+  });
+
+  // Rotas para itens OPME
+  app.get("/api/opme-items", isAuthenticated, async (req, res) => {
+    try {
+      // Opção de busca
+      const search = req.query.search as string;
+      
+      let opmeItems: OpmeItem[];
+      if (search && search.length > 0) {
+        opmeItems = await storage.searchOpmeItems(search);
+      } else {
+        opmeItems = await storage.getOpmeItems();
+      }
+      
+      res.json(opmeItems);
+    } catch (error) {
+      console.error("Erro ao buscar itens OPME:", error);
+      res.status(500).json({ message: "Erro ao buscar itens OPME" });
+    }
+  });
+
+  app.get("/api/opme-items/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de item OPME inválido" });
+      }
+      
+      const opmeItem = await storage.getOpmeItem(id);
+      if (!opmeItem) {
+        return res.status(404).json({ message: "Item OPME não encontrado" });
+      }
+      
+      res.json(opmeItem);
+    } catch (error) {
+      console.error("Erro ao buscar item OPME:", error);
+      res.status(500).json({ message: "Erro ao buscar item OPME" });
+    }
+  });
+
+  app.post("/api/opme-items", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      // Validar os dados do item OPME
+      const opmeItemData = insertOpmeItemSchema.parse(req.body);
+      
+      // Criar o novo item OPME
+      const newOpmeItem = await storage.createOpmeItem(opmeItemData);
+      
+      // Log da operação
+      console.log(`Item OPME ${newOpmeItem.technicalName} (ID: ${newOpmeItem.id}) criado por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(201).json(newOpmeItem);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de item OPME inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar item OPME:", error);
+      res.status(500).json({ message: "Erro ao criar item OPME" });
+    }
+  });
+
+  app.put("/api/opme-items/:id", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de item OPME inválido" });
+      }
+      
+      // Verificar se o item OPME existe
+      const opmeItem = await storage.getOpmeItem(id);
+      if (!opmeItem) {
+        return res.status(404).json({ message: "Item OPME não encontrado" });
+      }
+      
+      // Validar os dados do item OPME
+      const opmeItemData = insertOpmeItemSchema.parse(req.body);
+      
+      // Atualizar o item OPME
+      const updatedOpmeItem = await storage.updateOpmeItem(id, opmeItemData);
+      
+      // Log da operação
+      console.log(`Item OPME ${updatedOpmeItem?.technicalName} (ID: ${updatedOpmeItem?.id}) atualizado por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.json(updatedOpmeItem);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de item OPME inválidos", errors: error.errors });
+      }
+      console.error("Erro ao atualizar item OPME:", error);
+      res.status(500).json({ message: "Erro ao atualizar item OPME" });
+    }
+  });
+
+  app.delete("/api/opme-items/:id", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de item OPME inválido" });
+      }
+      
+      // Verificar se o item OPME existe
+      const opmeItem = await storage.getOpmeItem(id);
+      if (!opmeItem) {
+        return res.status(404).json({ message: "Item OPME não encontrado" });
+      }
+      
+      // Excluir o item OPME
+      await storage.deleteOpmeItem(id);
+      
+      // Log da operação
+      console.log(`Item OPME ${opmeItem.technicalName} (ID: ${opmeItem.id}) excluído por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erro ao excluir item OPME:", error);
+      res.status(500).json({ message: "Erro ao excluir item OPME" });
+    }
+  });
+  
+  // Rotas para relações entre OPMEs e Fornecedores
+  app.get("/api/opme-suppliers", isAuthenticated, async (req, res) => {
+    try {
+      const opmeItemId = req.query.opmeItemId ? parseInt(req.query.opmeItemId as string) : undefined;
+      const supplierId = req.query.supplierId ? parseInt(req.query.supplierId as string) : undefined;
+      const active = req.query.active === "true" ? true : req.query.active === "false" ? false : undefined;
+      
+      const relations = await storage.getOpmeSuppliers(opmeItemId, supplierId, active);
+      res.json(relations);
+    } catch (error) {
+      console.error("Erro ao buscar relações OPME-Fornecedor:", error);
+      res.status(500).json({ message: "Erro ao buscar relações OPME-Fornecedor" });
+    }
+  });
+  
+  app.get("/api/opme-suppliers/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de relação OPME-Fornecedor inválido" });
+      }
+      
+      const relation = await storage.getOpmeSupplier(id);
+      if (!relation) {
+        return res.status(404).json({ message: "Relação OPME-Fornecedor não encontrada" });
+      }
+      
+      res.json(relation);
+    } catch (error) {
+      console.error("Erro ao buscar relação OPME-Fornecedor:", error);
+      res.status(500).json({ message: "Erro ao buscar relação OPME-Fornecedor" });
+    }
+  });
+  
+  app.get("/api/opme-items/:id/suppliers", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de item OPME inválido" });
+      }
+      
+      try {
+        const result = await storage.getOpmeItemWithSuppliers(id);
+        res.json(result);
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("não encontrado")) {
+          return res.status(404).json({ message: error.message });
+        }
+        throw error;
+      }
+    } catch (error) {
+      console.error("Erro ao buscar item OPME com fornecedores:", error);
+      res.status(500).json({ message: "Erro ao buscar item OPME com fornecedores" });
+    }
+  });
+  
+  app.post("/api/opme-suppliers", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      // Validar os dados da relação
+      const relationData = insertOpmeSupplierSchema.parse(req.body);
+      
+      try {
+        // Criar a relação
+        const newRelation = await storage.createOpmeSupplier(relationData);
+        
+        // Log da operação
+        console.log(`Relação OPME-Fornecedor (ID: ${newRelation.id}) criada por usuário ${req.user?.username || 'sistema'}`);
+        
+        res.status(201).json(newRelation);
+      } catch (error) {
+        if (error instanceof Error) {
+          return res.status(400).json({ message: error.message });
+        }
+        throw error;
+      }
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de relação OPME-Fornecedor inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar relação OPME-Fornecedor:", error);
+      res.status(500).json({ message: "Erro ao criar relação OPME-Fornecedor" });
+    }
+  });
+  
+  app.put("/api/opme-suppliers/:id", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de relação OPME-Fornecedor inválido" });
+      }
+      
+      // Validar os dados da relação
+      const relationData = insertOpmeSupplierSchema.partial().parse(req.body);
+      
+      // Atualizar a relação
+      const updatedRelation = await storage.updateOpmeSupplier(id, relationData);
+      
+      if (!updatedRelation) {
+        return res.status(404).json({ message: "Relação OPME-Fornecedor não encontrada" });
+      }
+      
+      // Log da operação
+      console.log(`Relação OPME-Fornecedor (ID: ${updatedRelation.id}) atualizada por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.json(updatedRelation);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados de relação OPME-Fornecedor inválidos", errors: error.errors });
+      }
+      console.error("Erro ao atualizar relação OPME-Fornecedor:", error);
+      res.status(500).json({ message: "Erro ao atualizar relação OPME-Fornecedor" });
+    }
+  });
+  
+  app.delete("/api/opme-suppliers/:id", isAuthenticated, hasPermission("manage_opme"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de relação OPME-Fornecedor inválido" });
+      }
+      
+      // Verificar se a relação existe
+      const relation = await storage.getOpmeSupplier(id);
+      if (!relation) {
+        return res.status(404).json({ message: "Relação OPME-Fornecedor não encontrada" });
+      }
+      
+      // Excluir a relação
+      await storage.deleteOpmeSupplier(id);
+      
+      // Log da operação
+      console.log(`Relação OPME-Fornecedor (ID: ${relation.id}) excluída por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erro ao excluir relação OPME-Fornecedor:", error);
+      res.status(500).json({ message: "Erro ao excluir relação OPME-Fornecedor" });
+    }
+  });
+  
+  // ===== Rotas para gerenciamento de associações médico-paciente =====
+  
+  // Rota para obter pacientes associados a um médico
+  app.get("/api/doctors/:doctorId/patients", isAuthenticated, async (req, res) => {
+    try {
+      const doctorId = parseInt(req.params.doctorId);
+      if (isNaN(doctorId)) {
+        return res.status(400).json({ message: "ID do médico inválido" });
+      }
+      
+      // Verifica se o usuário está acessando seus próprios dados ou tem permissão
+      if (doctorId !== req.user?.id && !hasPermissionCheck(req, "users_view")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Obtém pacientes com detalhes adicionais
+      const patients = await storage.getDoctorPatientsWithDetails(doctorId);
+      
+      res.json(patients);
+    } catch (error) {
+      console.error("Erro ao buscar pacientes do médico:", error);
+      res.status(500).json({ message: "Erro ao buscar pacientes associados" });
+    }
+  });
+  
+  // Rota para obter médicos associados a um paciente
+  app.get("/api/patients/:patientId/doctors", isAuthenticated, async (req, res) => {
+    try {
+      const patientId = parseInt(req.params.patientId);
+      if (isNaN(patientId)) {
+        return res.status(400).json({ message: "ID do paciente inválido" });
+      }
+      
+      // Obtém médicos com detalhes
+      const doctors = await storage.getPatientDoctors(patientId);
+      
+      res.json(doctors);
+    } catch (error) {
+      console.error("Erro ao buscar médicos do paciente:", error);
+      res.status(500).json({ message: "Erro ao buscar médicos associados" });
+    }
+  });
+  
+  // Rota para desassociar um paciente de um médico (remove a associação)
+  app.delete("/api/doctors/:doctorId/patients/:patientId", isAuthenticated, async (req, res) => {
+    try {
+      const doctorId = parseInt(req.params.doctorId);
+      const patientId = parseInt(req.params.patientId);
+      
+      if (isNaN(doctorId) || isNaN(patientId)) {
+        return res.status(400).json({ message: "IDs inválidos" });
+      }
+      
+      // Verificar permissão: apenas o próprio médico pode remover seus pacientes
+      if (req.user?.id !== doctorId && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Remove a associação
+      const result = await storage.removeDoctorPatient(doctorId, patientId);
+      
+      // Log da operação
+      console.log(`Paciente (ID: ${patientId}) desassociado do médico (ID: ${doctorId}) por usuário ${req.user?.username || 'sistema'}`);
+      
+      res.status(200).json({ success: result });
+    } catch (error) {
+      console.error("Erro ao desassociar paciente do médico:", error);
+      res.status(500).json({ message: "Erro ao desassociar paciente" });
+    }
+  });
+  
+  // Rota para criar uma associação médico-paciente
+  app.post("/api/doctor-patients", isAuthenticated, async (req, res) => {
+    try {
+      // Validar dados de entrada
+      const associationData = insertDoctorPatientSchema.parse(req.body);
+      
+      // Verifica se o usuário está criando sua própria associação ou tem permissão
+      if (associationData.doctorId !== req.user?.id && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Cria a associação
+      const association = await storage.addDoctorPatient(associationData);
+      
+      res.status(201).json(association);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Dados inválidos", errors: error.errors });
+      }
+      console.error("Erro ao criar associação médico-paciente:", error);
+      res.status(500).json({ message: "Erro ao criar associação" });
+    }
+  });
+  
+  // Rota para atualizar o status de uma associação médico-paciente
+  app.patch("/api/doctor-patients/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID da associação inválido" });
+      }
+      
+      const { isActive } = req.body;
+      if (typeof isActive !== 'boolean') {
+        return res.status(400).json({ message: "O campo isActive deve ser um booleano" });
+      }
+      
+      // Atualiza a associação
+      const updatedAssociation = await storage.updateDoctorPatient(id, isActive);
+      
+      if (!updatedAssociation) {
+        return res.status(404).json({ message: "Associação não encontrada" });
+      }
+      
+      res.json(updatedAssociation);
+    } catch (error) {
+      console.error("Erro ao atualizar associação médico-paciente:", error);
+      res.status(500).json({ message: "Erro ao atualizar associação" });
+    }
+  });
+  
+  // Rota para remover uma associação médico-paciente
+  app.delete("/api/doctor-patients", isAuthenticated, async (req, res) => {
+    try {
+      const { doctorId, patientId } = req.body;
+      
+      if (!doctorId || !patientId) {
+        return res.status(400).json({ message: "IDs do médico e paciente são obrigatórios" });
+      }
+      
+      // Verifica se o usuário está removendo sua própria associação ou tem permissão
+      if (doctorId !== req.user?.id && !hasPermissionCheck(req, "users_edit")) {
+        return res.status(403).json({ message: "Permissão negada" });
+      }
+      
+      // Remove a associação
+      await storage.removeDoctorPatient(doctorId, patientId);
+      
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erro ao remover associação médico-paciente:", error);
+      res.status(500).json({ message: "Erro ao remover associação" });
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}
